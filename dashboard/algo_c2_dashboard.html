@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Algo C2 Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<style>
+:root {
+  --bg: #0a0e17; --bg2: #111827; --bg3: #1f2937;
+  --fg: #e5e7eb; --fg2: #9ca3af; --accent: #3b82f6;
+  --green: #10b981; --red: #ef4444; --yellow: #f59e0b;
+  --teal: #14b8a6; --coral: #f87171; --purple: #a78bfa;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; background: var(--bg); color: var(--fg); font-size: 13px; overflow-x: hidden; }
+
+/* Header */
+.header { background: var(--bg2); border-bottom: 1px solid var(--bg3); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.header h1 span { color: var(--accent); }
+.header-metrics { display: flex; gap: 20px; }
+.metric { text-align: center; }
+.metric-value { font-size: 18px; font-weight: 700; }
+.metric-label { font-size: 10px; color: var(--fg2); text-transform: uppercase; }
+.metric-value.up { color: var(--green); }
+.metric-value.down { color: var(--red); }
+
+/* Tabs */
+.tab-bar { background: var(--bg2); display: flex; border-bottom: 1px solid var(--bg3); padding: 0 20px; }
+.tab { padding: 10px 18px; cursor: pointer; color: var(--fg2); border-bottom: 2px solid transparent; transition: all 0.2s; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.tab:hover { color: var(--fg); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Controls */
+.controls { background: var(--bg2); padding: 10px 20px; display: flex; gap: 24px; align-items: center; border-bottom: 1px solid var(--bg3); flex-wrap: wrap; }
+.control-group { display: flex; align-items: center; gap: 8px; }
+.control-group label { color: var(--fg2); font-size: 11px; text-transform: uppercase; }
+.control-group input[type="range"] { width: 120px; accent-color: var(--accent); }
+.control-group .val { color: var(--accent); min-width: 40px; }
+.control-group select { background: var(--bg3); color: var(--fg); border: 1px solid var(--bg3); padding: 4px 8px; border-radius: 4px; }
+
+/* Tab panels */
+.panel { display: none; padding: 20px; }
+.panel.active { display: block; }
+
+/* Charts */
+.chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.chart-box { background: var(--bg2); border-radius: 8px; padding: 16px; border: 1px solid var(--bg3); }
+.chart-box h3 { font-size: 12px; color: var(--fg2); margin-bottom: 10px; text-transform: uppercase; }
+.chart-box canvas { width: 100% !important; }
+.chart-full { grid-column: 1 / -1; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { background: var(--bg3); padding: 8px 12px; text-align: left; color: var(--fg2); text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+td { padding: 6px 12px; border-bottom: 1px solid var(--bg3); }
+tr:hover td { background: rgba(59,130,246,0.05); }
+.pnl-pos { color: var(--green); }
+.pnl-neg { color: var(--red); }
+
+/* File loader */
+.loader { text-align: center; padding: 60px 20px; }
+.loader p { color: var(--fg2); margin-bottom: 16px; }
+.loader input[type="file"] { display: none; }
+.loader .btn { background: var(--accent); color: white; padding: 10px 24px; border-radius: 6px; cursor: pointer; border: none; font-family: inherit; font-size: 13px; }
+.loader .btn:hover { filter: brightness(1.1); }
+
+/* Graph canvas */
+#graphCanvas { background: var(--bg2); border-radius: 8px; border: 1px solid var(--bg3); cursor: grab; }
+
+/* Regime bar */
+.regime-bar { display: flex; height: 24px; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+.regime-bar div { display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 600; }
+.regime-NORMAL { background: var(--green); color: #000; }
+.regime-LOW_VOL { background: var(--teal); color: #000; }
+.regime-TRANSITIONAL { background: var(--yellow); color: #000; }
+.regime-HIGH_STRESS { background: var(--coral); color: #000; }
+.regime-FRAGMENTED { background: var(--red); color: #fff; }
+
+/* Stats grid */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.stat-card { background: var(--bg2); border-radius: 8px; padding: 14px; border: 1px solid var(--bg3); }
+.stat-card .label { font-size: 10px; color: var(--fg2); text-transform: uppercase; margin-bottom: 4px; }
+.stat-card .value { font-size: 20px; font-weight: 700; }
+
+/* Gate bar */
+.gate-bars { display: flex; gap: 8px; margin: 12px 0; }
+.gate-bar-item { flex: 1; text-align: center; }
+.gate-bar-item .bar { height: 6px; border-radius: 3px; background: var(--bg3); margin-top: 4px; overflow: hidden; }
+.gate-bar-item .bar .fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+.gate-bar-item .name { font-size: 10px; color: var(--fg2); }
+.gate-bar-item .pct { font-size: 12px; font-weight: 600; }
+
+/* View mode select for topology */
+.view-modes { display: flex; gap: 8px; margin-bottom: 12px; }
+.view-mode { padding: 6px 14px; background: var(--bg3); border: 1px solid var(--bg3); border-radius: 4px; cursor: pointer; color: var(--fg2); font-size: 11px; }
+.view-mode.active { background: var(--accent); color: white; border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>Algo <span>C2</span> Dashboard</h1>
+  <div class="header-metrics">
+    <div class="metric"><div class="metric-value" id="hBalance">$50.00</div><div class="metric-label">Balance</div></div>
+    <div class="metric"><div class="metric-value" id="hTrades">0</div><div class="metric-label">Trades</div></div>
+    <div class="metric"><div class="metric-value" id="hWinRate">0%</div><div class="metric-label">Win Rate</div></div>
+    <div class="metric"><div class="metric-value" id="hPF">0.00</div><div class="metric-label">PF</div></div>
+    <div class="metric"><div class="metric-value" id="hMaxDD">0%</div><div class="metric-label">Max DD</div></div>
+    <div class="metric"><div class="metric-value" id="hRegime">--</div><div class="metric-label">Regime</div></div>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div class="tab-bar">
+  <div class="tab active" data-tab="signal">Signal</div>
+  <div class="tab" data-tab="topology">Topology</div>
+  <div class="tab" data-tab="performance">Performance</div>
+  <div class="tab" data-tab="book">Book</div>
+  <div class="tab" data-tab="optimisation">Optimisation</div>
+  <div class="tab" data-tab="regime">Regime</div>
+</div>
+
+<!-- Controls -->
+<div class="controls">
+  <div class="control-group">
+    <label>CB Thr</label>
+    <input type="range" id="cbThr" min="55" max="85" value="65" step="1">
+    <span class="val" id="cbThrVal">0.65</span>
+  </div>
+  <div class="control-group">
+    <label>Risk %</label>
+    <input type="range" id="riskPct" min="1" max="5" value="2" step="0.5">
+    <span class="val" id="riskPctVal">2%</span>
+  </div>
+  <div class="control-group">
+    <label>Data</label>
+    <button class="btn" onclick="document.getElementById('fileInput').click()" style="background:var(--bg3);color:var(--fg);border:1px solid var(--bg3);padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;">Load JSON</button>
+    <input type="file" id="fileInput" accept=".json">
+  </div>
+</div>
+
+<!-- Signal Tab -->
+<div class="panel active" id="panel-signal">
+  <div class="loader" id="loader">
+    <p>Load backtest results JSON or analysis results JSON to populate the dashboard.</p>
+    <p style="color:var(--fg2);font-size:11px;margin-top:8px;">Generated by: <code>python backtester.py</code> or <code>python algo_c2_analysis.py</code></p>
+    <label class="btn" for="fileInput">Load Results JSON</label>
+  </div>
+  <div id="signalContent" style="display:none;">
+    <div class="chart-row">
+      <div class="chart-box chart-full"><h3>Equity Curve</h3><canvas id="equityChart"></canvas></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-box"><h3>Net Signal Score</h3><canvas id="netSignalChart"></canvas></div>
+      <div class="chart-box"><h3>Spectral Gap (L2)</h3><canvas id="spectralChart"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- Topology Tab -->
+<div class="panel" id="panel-topology">
+  <div class="view-modes">
+    <div class="view-mode active" data-view="correlation">Correlation</div>
+    <div class="view-mode" data-view="residual">Residuals</div>
+    <div class="view-mode" data-view="degree">Degree</div>
+    <div class="view-mode" data-view="cluster">Clusters</div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box"><h3>35-Node Graph</h3><canvas id="graphCanvas" width="580" height="450"></canvas></div>
+    <div class="chart-box">
+      <h3>Laplacian Summary</h3>
+      <div id="laplacianSummary" style="padding:8px;">
+        <div class="stats-grid" id="topoStats"></div>
+        <h3 style="margin-top:12px;">Top Mispricings</h3>
+        <table id="mispricingTable"><thead><tr><th>#</th><th>Pair</th><th>Residual</th><th>Signal</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Performance Tab -->
+<div class="panel" id="panel-performance">
+  <div class="stats-grid" id="perfStats"></div>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Win / Loss</h3><canvas id="winLossChart"></canvas></div>
+    <div class="chart-box"><h3>Trade PnL Distribution</h3><canvas id="pnlDistChart"></canvas></div>
+  </div>
+</div>
+
+<!-- Book Tab -->
+<div class="panel" id="panel-book">
+  <div class="chart-box" style="margin-bottom:16px;">
+    <h3>Open Positions</h3>
+    <table id="openTable"><thead><tr><th>Pair</th><th>Dir</th><th>Entry</th><th>TP</th><th>SL</th><th>Lot</th><th>Regime</th></tr></thead><tbody><tr><td colspan="7" style="color:var(--fg2)">No open positions</td></tr></tbody></table>
+  </div>
+  <div class="chart-box">
+    <h3>Closed Trades (Last 50)</h3>
+    <table id="closedTable"><thead><tr><th>Pair</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL ($)</th><th>PnL (pip)</th><th>Spread</th><th>Exit</th><th>Regime</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<!-- Optimisation Tab -->
+<div class="panel" id="panel-optimisation">
+  <div class="chart-box" style="margin-bottom:16px;">
+    <h3>6-Gate Pass Rates</h3>
+    <div class="gate-bars" id="gateBars"></div>
+    <canvas id="gateChart" style="margin-top:16px;"></canvas>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Feature Importances (Top 20)</h3><canvas id="featureChart"></canvas></div>
+    <div class="chart-box"><h3>Model AUCs</h3><canvas id="aucChart"></canvas></div>
+  </div>
+</div>
+
+<!-- Regime Tab -->
+<div class="panel" id="panel-regime">
+  <div class="chart-box" style="margin-bottom:16px;">
+    <h3>Regime Timeline</h3>
+    <div class="regime-bar" id="regimeBar"></div>
+    <canvas id="regimeChart"></canvas>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Betti Numbers Over Time</h3><canvas id="bettiChart"></canvas></div>
+    <div class="chart-box"><h3>Regime Performance</h3><div id="regimePerf"></div></div>
+  </div>
+</div>
+
+<script>
+// -- State --
+let DATA = null;
+let charts = {};
+
+// -- Pairs --
+const PAIRS_FX = [
+  "AUDCAD","AUDCHF","AUDJPY","AUDNZD","AUDUSD","CADCHF","CADJPY","CHFJPY",
+  "EURAUD","EURCAD","EURCHF","EURGBP","EURJPY","EURNZD","EURUSD",
+  "GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPNZD","GBPUSD",
+  "NZDCAD","NZDCHF","NZDJPY","NZDUSD","USDCAD","USDCHF","USDJPY"
+];
+const PAIRS_NON_FX = ["BTCUSD","US30","USDMXN","USDZAR","XAGUSD","XAUUSD","XBRUSD"];
+const PAIRS_ALL = [...PAIRS_FX, ...PAIRS_NON_FX].sort();
+
+// Currency clusters for graph coloring
+const CLUSTERS = {
+  USD: ["USDCAD","USDCHF","USDJPY","USDMXN","USDZAR"],
+  EUR: ["EURAUD","EURCAD","EURCHF","EURGBP","EURJPY","EURNZD","EURUSD"],
+  GBP: ["GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPNZD","GBPUSD"],
+  JPY: ["AUDJPY","CADJPY","CHFJPY","NZDJPY"],
+  AUD: ["AUDCAD","AUDCHF","AUDNZD","AUDUSD"],
+  NZD: ["NZDCAD","NZDCHF","NZDUSD"],
+  CHF: ["CADCHF"],
+  Other: ["BTCUSD","US30","XAGUSD","XAUUSD","XBRUSD"],
+};
+const CLUSTER_COLORS = {USD:"#3b82f6",EUR:"#10b981",GBP:"#f59e0b",JPY:"#ef4444",AUD:"#a78bfa",NZD:"#14b8a6",CHF:"#f97316",Other:"#6b7280"};
+
+// -- Tab switching --
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// -- Controls --
+document.getElementById('cbThr').addEventListener('input', e => {
+  document.getElementById('cbThrVal').textContent = (e.target.value / 100).toFixed(2);
+});
+document.getElementById('riskPct').addEventListener('input', e => {
+  document.getElementById('riskPctVal').textContent = e.target.value + '%';
+});
+
+// -- File loading --
+document.getElementById('fileInput').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      DATA = JSON.parse(ev.target.result);
+      document.getElementById('loader').style.display = 'none';
+      document.getElementById('signalContent').style.display = 'block';
+      renderAll();
+    } catch (err) {
+      alert('Invalid JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+});
+
+// -- Chart defaults --
+Chart.defaults.color = '#9ca3af';
+Chart.defaults.borderColor = '#1f2937';
+Chart.defaults.font.family = "'SF Mono','Cascadia Code','Consolas',monospace";
+Chart.defaults.font.size = 11;
+Chart.defaults.plugins.legend.display = false;
+Chart.defaults.animation.duration = 300;
+
+function makeChart(id, config) {
+  if (charts[id]) charts[id].destroy();
+  const ctx = document.getElementById(id);
+  if (!ctx) return null;
+  charts[id] = new Chart(ctx, config);
+  return charts[id];
+}
+
+// -- Render all --
+function renderAll() {
+  if (!DATA) return;
+  updateHeader();
+  renderSignal();
+  renderTopology();
+  renderPerformance();
+  renderBook();
+  renderOptimisation();
+  renderRegime();
+}
+
+function updateHeader() {
+  const m = DATA.metrics || {};
+  const el = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  const balance = m.final_balance || DATA.config?.init_balance || 50;
+  const retPct = m.return_pct || 0;
+  el('hBalance', '$' + balance.toFixed(2));
+  document.getElementById('hBalance').className = 'metric-value ' + (retPct >= 0 ? 'up' : 'down');
+  el('hTrades', m.total_trades || 0);
+  el('hWinRate', ((m.win_rate || 0) * 100).toFixed(1) + '%');
+  el('hPF', (m.profit_factor || 0).toFixed(2));
+  el('hMaxDD', ((m.max_drawdown || 0) * 100).toFixed(1) + '%');
+  // Regime from laplacian or regime_timeline
+  const regime = DATA.laplacian?.regime || (DATA.regime_timeline?.length ? DATA.regime_timeline[DATA.regime_timeline.length-1][1] : '--');
+  el('hRegime', regime);
+}
+
+// -- Signal Tab --
+function renderSignal() {
+  // Equity curve
+  const eq = DATA.equity_curve || [];
+  if (eq.length > 0) {
+    const step = Math.max(1, Math.floor(eq.length / 500));
+    const labels = eq.filter((_,i) => i % step === 0).map(e => e[0]);
+    const values = eq.filter((_,i) => i % step === 0).map(e => e[1]);
+    makeChart('equityChart', {
+      type: 'line',
+      data: { labels, datasets: [{ data: values, borderColor: '#3b82f6', borderWidth: 1.5, pointRadius: 0, fill: { target: 'origin', above: 'rgba(59,130,246,0.08)', below: 'rgba(239,68,68,0.08)' } }] },
+      options: { scales: { x: { display: false }, y: { grid: { color: '#1f2937' } } }, plugins: { tooltip: { mode: 'index' } } }
+    });
+  }
+
+  // Net signal
+  const sig = DATA.signal_timeline || [];
+  if (sig.length > 0) {
+    const step = Math.max(1, Math.floor(sig.length / 300));
+    const labels = sig.filter((_,i) => i % step === 0).map(s => s[0]);
+    const values = sig.filter((_,i) => i % step === 0).map(s => s[1]);
+    const colors = values.map(v => v > 0 ? '#10b981' : v < 0 ? '#ef4444' : '#6b7280');
+    makeChart('netSignalChart', {
+      type: 'bar',
+      data: { labels, datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }] },
+      options: { scales: { x: { display: false }, y: { grid: { color: '#1f2937' } } } }
+    });
+  }
+
+  // Spectral gap (from regime_timeline or laplacian)
+  const spectral = DATA.laplacian?.spectral_gap;
+  if (spectral !== undefined) {
+    document.getElementById('spectralChart').parentElement.innerHTML =
+      '<h3>Spectral Gap (L2)</h3><div style="text-align:center;padding:40px;"><span style="font-size:48px;font-weight:700;color:var(--accent);">' +
+      spectral.toFixed(4) + '</span><br><span style="color:var(--fg2);font-size:11px;">Algebraic Connectivity</span></div>';
+  }
+}
+
+// -- Topology Tab --
+function renderTopology() {
+  renderGraph();
+  renderLaplacianSummary();
+}
+
+function renderGraph() {
+  const canvas = document.getElementById('graphCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Simple circular layout for 35 nodes
+  const pairs = PAIRS_ALL;
+  const n = pairs.length;
+  const cx = W / 2, cy = H / 2, radius = Math.min(W, H) * 0.38;
+
+  const nodes = pairs.map((p, i) => {
+    const angle = (2 * Math.PI * i / n) - Math.PI / 2;
+    return { pair: p, x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle), isFX: PAIRS_FX.includes(p) };
+  });
+
+  // Get residuals if available
+  const mispricings = DATA.laplacian?.top_mispricings || [];
+  const resMap = {};
+  mispricings.forEach(m => { resMap[m.pair] = m.residual; });
+
+  // Draw edges (simplified — connect pairs with non-zero correlation proxy)
+  ctx.lineWidth = 0.3;
+  ctx.globalAlpha = 0.15;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      ctx.strokeStyle = '#14b8a6';
+      ctx.beginPath();
+      ctx.moveTo(nodes[i].x, nodes[i].y);
+      ctx.lineTo(nodes[j].x, nodes[j].y);
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Draw nodes
+  nodes.forEach(node => {
+    const res = resMap[node.pair] || 0;
+    let color;
+    if (Math.abs(res) > 0.0001) {
+      color = res > 0 ? '#3b82f6' : '#ef4444';
+    } else {
+      // Cluster color
+      color = '#6b7280';
+      for (const [cluster, pairs] of Object.entries(CLUSTERS)) {
+        if (pairs.includes(node.pair)) { color = CLUSTER_COLORS[cluster]; break; }
+      }
+    }
+
+    const r = node.isFX ? 8 : 10;
+    if (node.isFX) {
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    } else {
+      // Diamond for non-FX
+      ctx.beginPath();
+      ctx.moveTo(node.x, node.y - r);
+      ctx.lineTo(node.x + r, node.y);
+      ctx.lineTo(node.x, node.y + r);
+      ctx.lineTo(node.x - r, node.y);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // Label
+    ctx.fillStyle = '#e5e7eb';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(node.pair.replace('USD',''), node.x, node.y + r + 12);
+  });
+}
+
+function renderLaplacianSummary() {
+  const lap = DATA.laplacian;
+  if (!lap) return;
+
+  const stats = document.getElementById('topoStats');
+  stats.innerHTML = [
+    { label: 'Spectral Gap', value: lap.spectral_gap?.toFixed(4) || '--' },
+    { label: 'Sigma', value: lap.sigma?.toFixed(4) || '--' },
+    { label: 'Beta-0', value: lap.beta_0 ?? '--' },
+    { label: 'Beta-1', value: lap.beta_1 ?? '--' },
+    { label: 'H1 Lifespan', value: lap.h1_lifespan?.toFixed(4) || '--' },
+    { label: 'Regime', value: lap.regime || '--' },
+  ].map(s => `<div class="stat-card"><div class="label">${s.label}</div><div class="value">${s.value}</div></div>`).join('');
+
+  // Mispricing table
+  const tbody = document.querySelector('#mispricingTable tbody');
+  const mp = lap.top_mispricings || [];
+  tbody.innerHTML = mp.slice(0, 10).map((m, i) => {
+    const color = m.signal === 'LONG' ? 'var(--green)' : m.signal === 'SHORT' ? 'var(--red)' : 'var(--fg2)';
+    return `<tr><td>${i+1}</td><td>${m.pair}</td><td>${m.residual.toFixed(6)}</td><td style="color:${color}">${m.signal}</td></tr>`;
+  }).join('');
+}
+
+// -- Performance Tab --
+function renderPerformance() {
+  const m = DATA.metrics || {};
+  const stats = document.getElementById('perfStats');
+  const items = [
+    { label: 'Total Trades', value: m.total_trades || 0 },
+    { label: 'Winners', value: m.winners || 0 },
+    { label: 'Losers', value: m.losers || 0 },
+    { label: 'Win Rate', value: ((m.win_rate||0)*100).toFixed(1) + '%' },
+    { label: 'Avg Win', value: '$' + (m.avg_win||0).toFixed(4) },
+    { label: 'Avg Loss', value: '$' + (m.avg_loss||0).toFixed(4) },
+    { label: 'Expected Value', value: '$' + (m.ev||0).toFixed(4) },
+    { label: 'Profit Factor', value: (m.profit_factor||0).toFixed(2) },
+    { label: 'Max Drawdown', value: ((m.max_drawdown||0)*100).toFixed(1) + '%' },
+    { label: 'Return', value: ((m.return_pct||0)*100).toFixed(2) + '%' },
+    { label: 'Sharpe', value: (m.sharpe||0).toFixed(2) },
+    { label: 'Spread Drag', value: '$' + (m.spread_drag||0).toFixed(4) },
+  ];
+  stats.innerHTML = items.map(s => {
+    let valClass = '';
+    if (s.label === 'Return') valClass = (m.return_pct||0) >= 0 ? 'up' : 'down';
+    return `<div class="stat-card"><div class="label">${s.label}</div><div class="value ${valClass}">${s.value}</div></div>`;
+  }).join('');
+
+  // Win/Loss doughnut
+  const w = m.winners || 0, l = m.losers || 0;
+  if (w + l > 0) {
+    makeChart('winLossChart', {
+      type: 'doughnut',
+      data: { labels: ['Winners','Losers'], datasets: [{ data: [w, l], backgroundColor: ['#10b981','#ef4444'], borderWidth: 0 }] },
+      options: { plugins: { legend: { display: true, position: 'bottom' } }, cutout: '60%' }
+    });
+  }
+
+  // PnL distribution
+  const trades = DATA.trades || [];
+  if (trades.length > 0) {
+    const pnls = trades.map(t => t.pnl_usd);
+    const colors = pnls.map(p => p >= 0 ? '#10b981' : '#ef4444');
+    makeChart('pnlDistChart', {
+      type: 'bar',
+      data: { labels: trades.map((_,i) => i+1), datasets: [{ data: pnls, backgroundColor: colors, borderWidth: 0 }] },
+      options: { scales: { x: { display: false }, y: { grid: { color: '#1f2937' } } } }
+    });
+  }
+}
+
+// -- Book Tab --
+function renderBook() {
+  const trades = DATA.trades || [];
+  const tbody = document.querySelector('#closedTable tbody');
+  const last50 = trades.slice(-50).reverse();
+  tbody.innerHTML = last50.map(t => {
+    const pnlClass = t.pnl_usd >= 0 ? 'pnl-pos' : 'pnl-neg';
+    return `<tr>
+      <td>${t.pair}</td>
+      <td style="color:${t.direction==='LONG'?'var(--green)':'var(--red)'}">${t.direction}</td>
+      <td>${t.entry_price?.toFixed(5) || '--'}</td>
+      <td>${t.exit_price?.toFixed(5) || '--'}</td>
+      <td class="${pnlClass}">${t.pnl_usd >= 0 ? '+' : ''}${t.pnl_usd?.toFixed(4) || '0'}</td>
+      <td class="${pnlClass}">${t.pnl_pips?.toFixed(1) || '0'}</td>
+      <td>${t.spread_cost?.toFixed(4) || '0'}</td>
+      <td>${t.exit_reason || '--'}</td>
+      <td>${t.entry_regime || '--'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// -- Optimisation Tab --
+function renderOptimisation() {
+  const gs = DATA.gate_stats || {};
+  const gates = ['g1','g2','g3','g4','g5','g6'];
+  const gateNames = ['Net Score','CB Floor','EMA Trend','ATR Window','Agreement','Regime'];
+  const gateColors = ['#3b82f6','#10b981','#f59e0b','#a78bfa','#14b8a6','#f97316'];
+
+  // Gate bars
+  const container = document.getElementById('gateBars');
+  container.innerHTML = gates.map((g, i) => {
+    const pct = ((gs[g] || 0) * 100).toFixed(1);
+    return `<div class="gate-bar-item">
+      <div class="name">${gateNames[i]}</div>
+      <div class="pct" style="color:${gateColors[i]}">${pct}%</div>
+      <div class="bar"><div class="fill" style="width:${pct}%;background:${gateColors[i]}"></div></div>
+    </div>`;
+  }).join('');
+
+  // Gate bar chart
+  makeChart('gateChart', {
+    type: 'bar',
+    data: {
+      labels: gateNames,
+      datasets: [{ data: gates.map(g => ((gs[g]||0)*100)), backgroundColor: gateColors, borderWidth: 0 }]
+    },
+    options: { scales: { y: { max: 100, grid: { color: '#1f2937' } }, x: { grid: { display: false } } } }
+  });
+
+  // Feature importances
+  const fi = DATA.feature_importances || [];
+  if (fi.length > 0) {
+    makeChart('featureChart', {
+      type: 'bar',
+      data: {
+        labels: fi.map(f => f.feature.length > 25 ? f.feature.slice(0,25)+'...' : f.feature),
+        datasets: [{ data: fi.map(f => f.importance), backgroundColor: '#3b82f6', borderWidth: 0 }]
+      },
+      options: { indexAxis: 'y', scales: { x: { grid: { color: '#1f2937' } }, y: { grid: { display: false } } } }
+    });
+  }
+
+  // Model AUCs
+  const models = DATA.models || {};
+  const modelNames = Object.keys(models);
+  if (modelNames.length > 0) {
+    makeChart('aucChart', {
+      type: 'bar',
+      data: {
+        labels: modelNames,
+        datasets: [{ data: modelNames.map(n => models[n].auc || 0.5), backgroundColor: '#10b981', borderWidth: 0 }]
+      },
+      options: { scales: { y: { min: 0.4, max: 0.6, grid: { color: '#1f2937' } }, x: { grid: { display: false } } } }
+    });
+  }
+}
+
+// -- Regime Tab --
+function renderRegime() {
+  const timeline = DATA.regime_timeline || [];
+  if (timeline.length === 0) return;
+
+  // Regime bar
+  const regimeBar = document.getElementById('regimeBar');
+  const regimeCounts = {};
+  timeline.forEach(([_,r]) => { regimeCounts[r] = (regimeCounts[r] || 0) + 1; });
+  const total = timeline.length;
+  regimeBar.innerHTML = Object.entries(regimeCounts).map(([regime, count]) => {
+    const pct = (count / total * 100).toFixed(1);
+    return `<div class="regime-${regime}" style="width:${pct}%">${regime} ${pct}%</div>`;
+  }).join('');
+
+  // Regime over time (simplified as step chart)
+  const regimeMap = { 'NORMAL': 2, 'LOW_VOL': 1, 'TRANSITIONAL': 3, 'HIGH_STRESS': 4, 'FRAGMENTED': 5 };
+  const step = Math.max(1, Math.floor(timeline.length / 300));
+  const labels = timeline.filter((_,i) => i % step === 0).map(t => t[0]);
+  const values = timeline.filter((_,i) => i % step === 0).map(t => regimeMap[t[1]] || 2);
+  const colors = timeline.filter((_,i) => i % step === 0).map(t => {
+    const r = t[1];
+    if (r === 'NORMAL') return '#10b981';
+    if (r === 'LOW_VOL') return '#14b8a6';
+    if (r === 'TRANSITIONAL') return '#f59e0b';
+    if (r === 'HIGH_STRESS') return '#f87171';
+    if (r === 'FRAGMENTED') return '#ef4444';
+    return '#6b7280';
+  });
+
+  makeChart('regimeChart', {
+    type: 'bar',
+    data: { labels, datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }] },
+    options: {
+      scales: {
+        x: { display: false },
+        y: { grid: { color: '#1f2937' }, ticks: { callback: v => ['','LOW_VOL','NORMAL','TRANS','STRESS','FRAG'][v] || '' } }
+      }
+    }
+  });
+}
+
+// -- View mode switching for topology --
+document.querySelectorAll('.view-mode').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.view-mode').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderGraph();
+  });
+});
+</script>
+</body>
+</html>

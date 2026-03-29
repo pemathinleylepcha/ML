@@ -1,0 +1,149 @@
+
+=== Algo C2 v2 — CatBoost Dual-Subnet Training ===
+
+Detected quarterly CSV structure in d:/Algo-C2/data/DataExtractor ...
+  Loaded 41 instruments from 9 years at M5
+  Master timeline: 275213 bars  (2018-01-02 00:00:00 -> 2026-03-25 07:35:00)
+  After alignment: 41 instruments, 275213 bars each
+Loaded 41 instruments, 146345 bars each
+
+[1/4] Building feature matrices...
+  n_total=146345 bars across 41 instruments
+  Warmup=200, horizon=5, lookback=120
+  Label mode: quantile  (buy_pct=0.3, sell_pct=0.3)
+  BTC label dist: SELL=31062(21.2%)  HOLD=84221(57.6%)  BUY=31062(21.2%)
+  FX  label dist (EURUSD): SELL=22330(15.3%)  HOLD=101685(69.5%)  BUY=22330(15.3%)
+  [  0.0%] bar 200/146345  [  5.0%] bar 7507/146345  [ 10.0%] bar 14814/146345  [ 15.0%] bar 22121/146345  [ 20.0%] bar 29428/146345  [ 25.0%] bar 36735/146345  [ 30.0%] bar 44042/146345  [ 35.0%] bar 51349/146345  [ 40.0%] bar 58656/146345  [ 45.0%] bar 65963/146345  [ 50.0%] bar 73270/146345  [ 55.0%] bar 80577/146345  [ 60.0%] bar 87884/146345  [ 65.0%] bar 95191/146345  [ 70.0%] bar 102498/146345  [ 75.0%] bar 109805/146345  [ 80.0%] bar 117112/146345  [ 85.0%] bar 124419/146345  [ 90.0%] bar 131726/146345  [ 95.0%] bar 139033/146345D:\Algo-C2\src\train_catboost_v2.py:1092: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "trained_on": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+
+  Validity mask: BTC 103528/146140 real bars (70.8%)
+  Validity mask: FX  74433/146140 real bars (50.9%) [sample: EURUSD]
+  BTC: (103528, 41), class dist: [31050 41416 31062]
+  FX:  (1793546, 144), class dist: [538101 717503 537942]
+
+[1b/4] Feature selection (BTC top-20, FX top-40)...
+  Feature select [BTC]: 41 -> 20 cols  top5: ['col12=51.41', 'col38=41.77', 'col17=1.97', 'col5=1.43', 'col35=0.75']
+  Feature select [FX]: 144 -> 40 cols  top5: ['col140=48.05', 'col133=12.54', 'col126=9.34', 'col12=7.79', 'col123=1.19']
+  After selection — BTC: (103528, 20)  FX: (1793546, 40)
+
+[2/4] Walk-forward CV (5 folds)...
+
+  -- Fold 1/5 --
+  [BTC] Calibration  val_ll=1.1205  brier=0.2263  ECE=0.1935
+    SELL: 0.17->0.01(-0.16) | 0.22->0.00(-0.22) | 0.59->0.00(-0.59) | 0.74->0.48(-0.25)
+    HOLD: 0.13->0.48(+0.35) | 0.23->0.27(+0.04) | 0.57->0.68(+0.11) | 0.65->0.36(-0.29)
+    BUY : 0.13->0.06(-0.08) | 0.21->0.40(+0.19) | 0.52->0.98(+0.45) | 0.63->0.95(+0.32)
+    BTC: acc=0.5231  sharpe=-4.5597  train_ll=0.3165
+  [FX] Calibration  val_ll=1.3600  brier=0.2327  ECE=0.2300
+    SELL: 0.03->0.14(+0.11) | 0.30->0.36(+0.06) | 0.50->0.51(+0.01) | 0.70->0.60(-0.09) | 0.93->0.48(-0.45)
+    HOLD: 0.06->0.37(+0.31) | 0.31->0.37(+0.06) | 0.50->0.41(-0.09) | 0.70->0.59(-0.11) | 0.90->0.65(-0.24)
+    BUY : 0.04->0.13(+0.09) | 0.29->0.29(-0.00) | 0.51->0.29(-0.22) | 0.68->0.40(-0.28) | 0.95->0.52(-0.43)
+    FX:  acc=0.5328  sharpe=-2.3924  train_ll=0.3431
+
+  -- Fold 2/5 --
+  [BTC] Calibration  val_ll=0.6853  brier=0.1278  ECE=0.2650
+    SELL: 0.16->0.11(-0.05) | 0.24->0.48(+0.24) | 0.55->0.91(+0.37)
+    HOLD: 0.30->0.10(-0.20) | 0.56->0.37(-0.19) | 0.67->0.75(+0.08)
+    BUY : 0.16->0.00(-0.16) | 0.27->0.72(+0.45) | 0.52->0.82(+0.30)
+    BTC: acc=0.8372  sharpe=2.0265  train_ll=0.4233
+  [FX] Calibration  val_ll=0.7760  brier=0.1532  ECE=0.0837
+    SELL: 0.04->0.04(-0.00) | 0.28->0.28(+0.01) | 0.50->0.45(-0.05) | 0.70->0.65(-0.05) | 0.92->0.94(+0.03)
+    HOLD: 0.10->0.17(+0.08) | 0.30->0.34(+0.04) | 0.49->0.40(-0.09) | 0.70->0.73(+0.02) | 0.90->0.73(-0.18)
+    BUY : 0.05->0.16(+0.11) | 0.30->0.22(-0.07) | 0.51->0.65(+0.15) | 0.69->0.61(-0.08) | 0.89->0.81(-0.09)
+    FX:  acc=0.6858  sharpe=-2.9588  train_ll=0.4908
+
+  -- Fold 3/5 --
+  [BTC] Calibration  val_ll=0.2367  brier=0.0374  ECE=0.0594
+    SELL: 0.04->0.01(-0.03) | 0.28->0.12(-0.17) | 0.52->0.48(-0.04) | 0.68->0.73(+0.05)
+    HOLD: 0.10->0.10(+0.00) | 0.25->0.11(-0.13) | 0.47->0.51(+0.04) | 0.71->0.80(+0.09) | 0.91->0.98(+0.07)
+    BUY : 0.04->0.01(-0.03) | 0.34->0.38(+0.03) | 0.51->0.50(-0.01) | 0.75->0.87(+0.12) | 0.89->0.91(+0.02)
+    BTC: acc=0.9375  sharpe=-2.2955  train_ll=0.1249
+  [FX] Calibration  val_ll=1.0877  brier=0.2198  ECE=0.1737
+    SELL: 0.33->0.24(-0.09)
+    HOLD: 0.34->0.45(+0.11)
+    BUY : 0.33->0.32(-0.02)
+    FX:  acc=0.5227  sharpe=0.0000  train_ll=1.0719
+
+  -- Fold 4/5 --
+  [BTC] Calibration  val_ll=0.1997  brier=0.0297  ECE=0.0111
+    SELL: 0.02->0.03(+0.01) | 0.27->0.68(+0.42) | 0.46->0.29(-0.18)
+    HOLD: 0.03->0.01(-0.02) | 0.27->0.30(+0.03) | 0.52->0.78(+0.27) | 0.68->0.82(+0.14) | 0.95->0.95(+0.00)
+    BUY : 0.03->0.00(-0.02) | 0.34->0.07(-0.28) | 0.48->0.23(-0.25) | 0.72->0.70(-0.02) | 0.97->0.99(+0.02)
+    BTC: acc=0.9517  sharpe=-0.1797  train_ll=0.1320
+  [FX] Calibration  val_ll=1.0042  brier=0.2033  ECE=0.1266
+    SELL: 0.17->0.00(-0.16) | 0.28->0.41(+0.13) | 0.49->0.60(+0.11) | 0.67->0.66(-0.01)
+    HOLD: 0.18->0.24(+0.06) | 0.35->0.47(+0.11) | 0.50->0.28(-0.22)
+    BUY : 0.16->0.03(-0.12) | 0.30->0.09(-0.21) | 0.49->0.74(+0.25)
+    FX:  acc=0.5302  sharpe=-3.4828  train_ll=0.8719
+
+  -- Fold 5/5 --
+  [BTC] Calibration  val_ll=2.2983  brier=0.3985  ECE=0.5865
+    SELL: 0.05->0.00(-0.05) | 0.31->0.00(-0.31) | 0.49->0.47(-0.02)
+    HOLD: 0.37->0.00(-0.37) | 0.47->0.33(-0.14) | 0.71->0.44(-0.27) | 0.92->0.33(-0.59)
+    BUY : 0.03->0.67(+0.63)
+    BTC: acc=0.3322  sharpe=0.8134  train_ll=0.1831
+  [FX] Calibration  val_ll=1.0034  brier=0.2009  ECE=0.3563
+    SELL: 0.34->0.41(+0.07) | 0.43->0.81(+0.37)
+    HOLD: 0.34->0.37(+0.03)
+    BUY : 0.29->0.10(-0.19) | 0.44->0.84(+0.40)
+    FX:  acc=0.7378  sharpe=-1.2754  train_ll=1.0289
+
+[3/4] PBO Analysis...
+
+  PBO Report - CatBoost-BTC
+  -------------------------
+  PBO (CSCV):      0.6000  (10 combinations)
+  Omega:           mean=-0.1792  std=0.8121
+  Walk-Fwd Eff:    -1.0282  (OOS/IS Sharpe ratio; 1.0 = ideal)
+  DSR:             1.0000  (Deflated Sharpe Ratio)
+  PSR per fold:    F0=0.00  F1=1.00  F2=0.00  F3=0.00  F4=1.00
+  Verdict:         HIGH OVERFIT: PBO=0.60 (>0.55) | OOS Sharpe negative (WFE=-1.03) | Sharpe survives multiple testing (DSR=1.00) | Mean PSR(SR*=0)=0.40
+
+  PBO Report - CatBoost-FX
+  ------------------------
+  PBO (CSCV):      0.7000  (10 combinations)
+  Omega:           mean=-0.3584  std=0.8596
+  Walk-Fwd Eff:    -3.4561  (OOS/IS Sharpe ratio; 1.0 = ideal)
+  DSR:             0.1043  (Deflated Sharpe Ratio)
+  PSR per fold:    F0=0.00  F1=0.00  F2=0.50  F3=0.00  F4=0.00
+  Verdict:         HIGH OVERFIT: PBO=0.70 (>0.55) | OOS Sharpe negative (WFE=-3.46) | Sharpe not significant after multi-test correction (DSR=0.10) | Mean PSR(SR*=0)=0.10
+
+  --- Calibration Summary ---
+  [BTC] Mean calibration across 5 folds: val_ll=0.9081  brier=0.1639  ECE=0.2231
+  [BTC] WARNING: ECE=0.2231 > 0.05 -- model may be miscalibrated
+  [FX] Mean calibration across 5 folds: val_ll=1.0463  brier=0.2020  ECE=0.1941
+  [FX] WARNING: ECE=0.1941 > 0.05 -- model may be miscalibrated
+
+[4/4] Final training on full dataset...
+
+  Training final CatBoost-BTC on 103528 samples...
+0:	learn: 0.8990460	total: 54.6ms	remaining: 27.2s
+50:	learn: 0.9540264	total: 3.59s	remaining: 31.6s
+100:	learn: 0.9642365	total: 6.73s	remaining: 26.6s
+150:	learn: 0.9730543	total: 9.98s	remaining: 23.1s
+200:	learn: 0.9744292	total: 12.9s	remaining: 19.2s
+250:	learn: 0.9759364	total: 15.9s	remaining: 15.8s
+300:	learn: 0.9770290	total: 19.1s	remaining: 12.6s
+350:	learn: 0.9774558	total: 22.2s	remaining: 9.44s
+400:	learn: 0.9779666	total: 25.5s	remaining: 6.3s
+450:	learn: 0.9786379	total: 28.7s	remaining: 3.12s
+499:	learn: 0.9788181	total: 31.8s	remaining: 0us
+
+  Training final CatBoost-FX on 1793546 samples (64055 bars x 28 pairs)...
+0:	learn: 0.6269406	total: 2.38s	remaining: 19m 50s
+50:	learn: 0.6928400	total: 2m 16s	remaining: 19m 57s
+100:	learn: 0.7180706	total: 4m 23s	remaining: 17m 19s
+150:	learn: 0.7319522	total: 6m 34s	remaining: 15m 12s
+200:	learn: 0.7418467	total: 8m 40s	remaining: 12m 53s
+250:	learn: 0.7523987	total: 10m 18s	remaining: 10m 13s
+300:	learn: 0.7604312	total: 11m 36s	remaining: 7m 40s
+350:	learn: 0.7681424	total: 12m 51s	remaining: 5m 27s
+400:	learn: 0.7720069	total: 14m 10s	remaining: 3m 29s
+450:	learn: 0.7763460	total: 15m 26s	remaining: 1m 40s
+499:	learn: 0.7793914	total: 16m 42s	remaining: 0us
+
+  Saved: models\v1_5_c1\catboost_btc_v1_5_c1.cbm
+  Saved: models\v1_5_c1\catboost_fx_v1_5_c1.cbm
+  Saved: models\v1_5_c1\catboost_feature_names_v1_5_c1.json
+
+Done.
