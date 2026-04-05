@@ -6,6 +6,21 @@
 
 ---
 
+## Current Blockers
+
+For active project issues, runtime failures, data-coverage gaps, and resolved operational incidents, use:
+- [PROJECT_ISSUES_LOG.md](/d:/Algo-C2-Codex/DOC/PROJECT_ISSUES_LOG.md)
+
+Current high-priority issues logged there:
+- `staged_v4` signal is still not robust across folds
+- remote training host stalls at `import torch` for real JIT runs
+- `repository-codex` historical coverage is still too incomplete for staged_v4 use
+
+Documentation rule:
+- Add a dated issue entry with evidence, affected files, and next action whenever a material blocker is discovered or resolved.
+
+---
+
 ## What was built in this session
 
 | # | Deliverable | File | Status |

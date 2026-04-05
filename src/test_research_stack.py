@@ -7,15 +7,19 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from export_research_stgnn_pack import FEATURE_ORDER, build_tensor_pack
 from research_bridge import BridgeContextEncoder
 from research_dataset import (
     BUY_CLASS,
     CanonicalResearchDataset,
+    FILL_POLICY_CARRY,
+    FILL_POLICY_MASK,
     SESSION_CODES,
     build_split_metadata,
     load_canonical_research_dataset,
     make_triple_barrier_labels,
 )
+from train_research_compact import _quarter_based_splits
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
@@ -64,6 +68,7 @@ class ResearchStackTests(unittest.TestCase):
         dataset = CanonicalResearchDataset(
             base_timeframe="M5",
             timeframes=("M5", "M15", "H1", "H4"),
+            fill_policy=FILL_POLICY_CARRY,
             tf_data=tf_data,
             base_timestamps=timestamps,
             session_codes=np.full(len(timestamps), SESSION_CODES["london"], dtype=np.int8),
@@ -75,6 +80,8 @@ class ResearchStackTests(unittest.TestCase):
         encoder = BridgeContextEncoder()
         ctx = encoder.encode(dataset, 5)
         self.assertEqual(len(ctx.features), 72)
+        matrix = encoder.build_feature_matrix(dataset)
+        self.assertEqual(matrix.shape, (len(timestamps), 72))
 
     def test_load_canonical_research_dataset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,6 +106,120 @@ class ResearchStackTests(unittest.TestCase):
             self.assertEqual(dataset.base_timeframe, "M5")
             self.assertGreater(dataset.n_bars, 0)
             self.assertIn("EURUSD", dataset.tf_data["M15"])
+            self.assertEqual(dataset.fill_policy, FILL_POLICY_CARRY)
+
+    def test_load_canonical_dataset_keeps_common_timeline_for_staggered_symbols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            btc_rows = []
+            btc_ts = pd.date_range("2026-01-01 00:05:00", periods=24, freq="5min")
+            for idx, dt in enumerate(btc_ts):
+                btc_rows.append({
+                    "bar_time": dt.strftime("%Y.%m.%d %H:%M:%S"),
+                    "open": 1.0 + idx * 0.001,
+                    "high": 1.002 + idx * 0.001,
+                    "low": 0.998 + idx * 0.001,
+                    "close": 1.001 + idx * 0.001,
+                    "tick_volume": 10 + idx,
+                    "spread": 0.0001,
+                    "real_volume": 0,
+                })
+
+            eur_rows = []
+            eur_ts = btc_ts[4:]
+            for idx, dt in enumerate(eur_ts):
+                eur_rows.append({
+                    "bar_time": dt.strftime("%Y.%m.%d %H:%M:%S"),
+                    "open": 1.2 + idx * 0.001,
+                    "high": 1.202 + idx * 0.001,
+                    "low": 1.198 + idx * 0.001,
+                    "close": 1.201 + idx * 0.001,
+                    "tick_volume": 20 + idx,
+                    "spread": 0.0001,
+                    "real_volume": 0,
+                })
+
+            _write_csv(root / "2026" / "Q1" / "BTCUSD" / "candles_M5.csv", btc_rows)
+            _write_csv(root / "2026" / "Q1" / "EURUSD" / "candles_M5.csv", eur_rows)
+
+            dataset = load_canonical_research_dataset(str(root), symbols=["BTCUSD", "EURUSD"])
+            self.assertEqual(dataset.n_bars, len(btc_ts))
+            self.assertEqual(len(dataset.tf_data["M5"]["BTCUSD"]["c"]), len(btc_ts))
+            self.assertEqual(len(dataset.tf_data["M5"]["EURUSD"]["c"]), len(btc_ts))
+            self.assertFalse(dataset.tf_data["M5"]["EURUSD"]["real"][:4].any())
+            self.assertTrue(dataset.tf_data["M5"]["EURUSD"]["real"][4:].all())
+
+    def test_mask_fill_policy_preserves_missing_bars_and_tensor_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            btc_rows = []
+            btc_ts = pd.date_range("2026-01-01 00:05:00", periods=24, freq="5min")
+            for idx, dt in enumerate(btc_ts):
+                btc_rows.append({
+                    "bar_time": dt.strftime("%Y.%m.%d %H:%M:%S"),
+                    "open": 1.0 + idx * 0.001,
+                    "high": 1.002 + idx * 0.001,
+                    "low": 0.998 + idx * 0.001,
+                    "close": 1.001 + idx * 0.001,
+                    "tick_volume": 10 + idx,
+                    "spread": 0.0001,
+                    "real_volume": 0,
+                })
+
+            eur_rows = []
+            eur_ts = btc_ts[4:]
+            for idx, dt in enumerate(eur_ts):
+                eur_rows.append({
+                    "bar_time": dt.strftime("%Y.%m.%d %H:%M:%S"),
+                    "open": 1.2 + idx * 0.001,
+                    "high": 1.202 + idx * 0.001,
+                    "low": 1.198 + idx * 0.001,
+                    "close": 1.201 + idx * 0.001,
+                    "tick_volume": 20 + idx,
+                    "spread": 0.0001,
+                    "real_volume": 0,
+                })
+
+            _write_csv(root / "2026" / "Q1" / "BTCUSD" / "candles_M5.csv", btc_rows)
+            _write_csv(root / "2026" / "Q1" / "EURUSD" / "candles_M5.csv", eur_rows)
+
+            dataset = load_canonical_research_dataset(
+                str(root),
+                symbols=["BTCUSD", "EURUSD"],
+                fill_policy=FILL_POLICY_MASK,
+            )
+            self.assertEqual(dataset.fill_policy, FILL_POLICY_MASK)
+            self.assertTrue(np.isnan(dataset.tf_data["M5"]["EURUSD"]["c"][:4]).all())
+            self.assertFalse(dataset.tf_data["M5"]["EURUSD"]["real"][:4].any())
+
+            pack, timestamps = build_tensor_pack(dataset)
+            m5_tensor = pack["M5"]
+            eur_idx = 1
+            close_idx = FEATURE_ORDER.index("c")
+            valid_idx = FEATURE_ORDER.index("validity")
+            session_idx = FEATURE_ORDER.index("session_code")
+            transition_idx = FEATURE_ORDER.index("session_transition")
+            regime_idx = FEATURE_ORDER.index("regime_signal")
+
+            self.assertEqual(m5_tensor.shape[-1], len(FEATURE_ORDER))
+            self.assertTrue(np.isnan(m5_tensor[:4, eur_idx, close_idx]).all())
+            self.assertTrue(np.allclose(m5_tensor[:4, eur_idx, valid_idx], 0.0))
+            self.assertTrue(np.isfinite(m5_tensor[:, eur_idx, session_idx]).all())
+            self.assertTrue(np.isfinite(m5_tensor[:, eur_idx, transition_idx]).all())
+            self.assertTrue(np.isfinite(m5_tensor[:, eur_idx, regime_idx]).all())
+            self.assertEqual(len(timestamps["M5"]), m5_tensor.shape[0])
+
+    def test_quarter_splits_accept_datetime64_timestamps(self):
+        timestamps = np.array(pd.date_range("2025-01-01", periods=12, freq="MS"), dtype="datetime64[ns]")
+        quarter_ids = np.array(
+            ["2025-Q1", "2025-Q1", "2025-Q1", "2025-Q2", "2025-Q2", "2025-Q2",
+             "2025-Q3", "2025-Q3", "2025-Q3", "2025-Q4", "2025-Q4", "2025-Q4"],
+            dtype=object,
+        )
+        splits, holdout_mask = _quarter_based_splits(quarter_ids, timestamps, ("2025-Q4",), purge_bars=1)
+        self.assertTrue(len(splits) >= 1)
+        self.assertIsNotNone(holdout_mask)
+        self.assertTrue(holdout_mask[-1])
 
 
 if __name__ == "__main__":

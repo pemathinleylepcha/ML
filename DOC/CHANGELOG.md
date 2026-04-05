@@ -3,6 +3,13 @@
 All architectural and feature changes that affect model training or inference.
 Ordered newest first. Each entry maps to a generation tag in GENERATIONS.md.
 
+Active blockers and operational issues are tracked separately in:
+- [PROJECT_ISSUES_LOG.md](/d:/Algo-C2-Codex/DOC/PROJECT_ISSUES_LOG.md)
+
+Documentation rule:
+- Use the changelog for model and architecture changes.
+- Use the issue log for active failures, runtime problems, data gaps, and resolved operational incidents.
+
 ---
 
 ## v1_5_c1 — 2026-03-27

@@ -72,6 +72,7 @@ def parse_tick_csv(filepath: Path) -> pd.DataFrame:
         sep="\t",
         header=0,
         names=["DATE", "TIME", "BID", "ASK", "LAST", "VOLUME", "FLAGS"],
+        usecols=[0, 1, 2, 3, 6],
         dtype={"DATE": str, "TIME": str},
         na_values=["", " "],
     )
@@ -97,6 +98,166 @@ def parse_tick_csv(filepath: Path) -> pd.DataFrame:
     df["spread"] = df["ASK"] - df["BID"]
 
     return df[["datetime", "BID", "ASK", "mid", "spread", "FLAGS"]].copy()
+
+
+def stream_resample_tick_csv(
+    filepath: Path,
+    instrument: str,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    chunksize: int = 250_000,
+) -> pd.DataFrame:
+    """
+    Stream-resample a raw MT5 tick CSV into 1-second bars without loading the full
+    tick file into memory.
+
+    This is intended for very large raw files where a full DataFrame parse may
+    cause excessive RAM usage or native parser crashes on constrained machines.
+    """
+    chunk_bars: list[pd.DataFrame] = []
+    last_bid: float | None = None
+    last_ask: float | None = None
+
+    reader = pd.read_csv(
+        filepath,
+        sep="\t",
+        header=0,
+        names=["DATE", "TIME", "BID", "ASK", "LAST", "VOLUME", "FLAGS"],
+        usecols=[0, 1, 2, 3, 6],
+        dtype={"DATE": str, "TIME": str},
+        na_values=["", " "],
+        chunksize=chunksize,
+        engine="python",
+    )
+
+    for chunk in reader:
+        if chunk.empty:
+            continue
+
+        bid = pd.to_numeric(chunk["BID"], errors="coerce")
+        ask = pd.to_numeric(chunk["ASK"], errors="coerce")
+        flags = pd.to_numeric(chunk["FLAGS"], errors="coerce").fillna(6).astype(np.int16)
+
+        bid = bid.ffill()
+        ask = ask.ffill()
+        if last_bid is not None:
+            bid = bid.fillna(last_bid)
+        if last_ask is not None:
+            ask = ask.fillna(last_ask)
+
+        valid = bid.notna() & ask.notna()
+        if not valid.any():
+            continue
+
+        chunk = chunk.loc[valid, ["DATE", "TIME"]].copy()
+        bid = bid.loc[valid]
+        ask = ask.loc[valid]
+        flags = flags.loc[valid]
+
+        last_bid = float(bid.iloc[-1])
+        last_ask = float(ask.iloc[-1])
+
+        datetimes = pd.to_datetime(
+            chunk["DATE"] + " " + chunk["TIME"],
+            format="%Y.%m.%d %H:%M:%S.%f",
+            errors="coerce",
+        )
+        valid_dt = datetimes.notna()
+        if not valid_dt.any():
+            continue
+
+        datetimes = datetimes.loc[valid_dt]
+        bid = bid.loc[valid_dt]
+        ask = ask.loc[valid_dt]
+        flags = flags.loc[valid_dt]
+
+        if start is not None:
+            mask = datetimes >= start
+            datetimes = datetimes.loc[mask]
+            bid = bid.loc[mask]
+            ask = ask.loc[mask]
+            flags = flags.loc[mask]
+        if end is not None:
+            mask = datetimes <= end
+            datetimes = datetimes.loc[mask]
+            bid = bid.loc[mask]
+            ask = ask.loc[mask]
+            flags = flags.loc[mask]
+        if datetimes.empty:
+            continue
+
+        mids = ((bid + ask) / 2.0).astype(np.float64)
+        spreads = (ask - bid).astype(np.float64)
+        sec = datetimes.dt.floor("s")
+        bid_tick = ((flags == 2) | (flags == 6)).astype(np.int32)
+        ask_tick = ((flags == 4) | (flags == 6)).astype(np.int32)
+
+        chunk_df = pd.DataFrame(
+            {
+                "dt": sec.to_numpy(),
+                "mid": mids.to_numpy(),
+                "spread": spreads.to_numpy(),
+                "bid_tick": bid_tick.to_numpy(),
+                "ask_tick": ask_tick.to_numpy(),
+            }
+        )
+
+        bars = (
+            chunk_df.groupby("dt", sort=True)
+            .agg(
+                o=("mid", "first"),
+                h=("mid", "max"),
+                l=("mid", "min"),
+                c=("mid", "last"),
+                spread_sum=("spread", "sum"),
+                tk=("mid", "count"),
+                _bid_cnt=("bid_tick", "sum"),
+                _ask_cnt=("ask_tick", "sum"),
+            )
+            .reset_index()
+        )
+        chunk_bars.append(bars)
+
+    if not chunk_bars:
+        return pd.DataFrame(columns=["dt", "o", "h", "l", "c", "sp", "tk", "tick_velocity", "spread_z", "bid_ask_imbalance", "price_velocity"])
+
+    merged = pd.concat(chunk_bars, ignore_index=True)
+    merged = (
+        merged.groupby("dt", sort=True)
+        .agg(
+            o=("o", "first"),
+            h=("h", "max"),
+            l=("l", "min"),
+            c=("c", "last"),
+            spread_sum=("spread_sum", "sum"),
+            tk=("tk", "sum"),
+            _bid_cnt=("_bid_cnt", "sum"),
+            _ask_cnt=("_ask_cnt", "sum"),
+        )
+        .reset_index()
+    )
+
+    merged["sp"] = merged["spread_sum"] / (merged["tk"].replace(0, np.nan))
+    merged["tick_velocity"] = merged["tk"].astype(float)
+
+    rolling_mean = merged["sp"].rolling(window=60, min_periods=1).mean()
+    rolling_std = merged["sp"].rolling(window=60, min_periods=1).std().fillna(0.0)
+    merged["spread_z"] = (merged["sp"] - rolling_mean) / (rolling_std + 1e-10)
+
+    total = merged["_bid_cnt"] + merged["_ask_cnt"]
+    merged["bid_ask_imbalance"] = (merged["_ask_cnt"] - merged["_bid_cnt"]) / (total + 1e-10)
+    merged["price_velocity"] = (merged["c"] - merged["c"].shift(1)) / (merged["c"].shift(1) + 1e-10)
+    merged["price_velocity"] = merged["price_velocity"].fillna(0.0)
+
+    merged["sp"] = merged["sp"].round(7)
+    merged["spread_z"] = merged["spread_z"].round(4)
+    merged["bid_ask_imbalance"] = merged["bid_ask_imbalance"].round(4)
+    merged["price_velocity"] = merged["price_velocity"].round(8)
+    merged["tk"] = merged["tk"].astype("int64")
+    merged["tick_velocity"] = merged["tick_velocity"].astype("float64")
+
+    merged = merged.drop(columns=["spread_sum", "_bid_cnt", "_ask_cnt"])
+    return merged[["dt", "o", "h", "l", "c", "sp", "tk", "tick_velocity", "spread_z", "bid_ask_imbalance", "price_velocity"]]
 
 
 # ── 1000ms resampling ─────────────────────────────────────────────────────────

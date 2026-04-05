@@ -5,3 +5,7 @@ __pycache__/
 .env
 *.json
 !package.json
+!src/staged_v4/data/
+!src/staged_v4/data/**
+!src/staged_v4/models/
+!src/staged_v4/models/**

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
+from dataextractor_contract import resolve_candle_path
 from feature_engine import compute_atr
 from universe import ALL_INSTRUMENTS, PIP_SIZES, TIMEFRAME_FREQ
 
 BASE_TIMEFRAME = "M5"
 DERIVED_TIMEFRAMES = ("M15", "H1", "H4")
 RESEARCH_TIMEFRAMES = (BASE_TIMEFRAME,) + DERIVED_TIMEFRAMES
+FILL_POLICY_CARRY = "carry"
+FILL_POLICY_MASK = "mask"
+VALID_FILL_POLICIES = {FILL_POLICY_CARRY, FILL_POLICY_MASK}
 
 _CSV_COLS = ["bar_time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
 _RENAME = {
@@ -37,6 +43,7 @@ HOLD_CLASS = 2
 class CanonicalResearchDataset:
     base_timeframe: str
     timeframes: tuple[str, ...]
+    fill_policy: str
     tf_data: dict[str, dict[str, dict[str, np.ndarray]]]
     base_timestamps: np.ndarray
     session_codes: np.ndarray
@@ -97,29 +104,48 @@ def _load_base_frames(
     symbols: Iterable[str] | None = None,
     start: str | None = None,
     end: str | None = None,
+    io_workers: int | None = None,
 ) -> dict[str, pd.DataFrame]:
-    selected = set(symbols or ALL_INSTRUMENTS)
+    selected = sorted(set(symbols or ALL_INSTRUMENTS))
     start_ts = pd.Timestamp(start) if start else None
     end_ts = pd.Timestamp(end) if end else None
     frames: dict[str, list[pd.DataFrame]] = {}
+    tasks: list[tuple[str, Path]] = []
 
     for year_dir in sorted(p for p in data_root.iterdir() if p.is_dir() and p.name.isdigit()):
         for quarter_dir in sorted(q for q in year_dir.iterdir() if q.is_dir() and q.name.startswith("Q")):
             for symbol in selected:
-                csv_path = quarter_dir / symbol / f"candles_{BASE_TIMEFRAME}.csv"
-                if not csv_path.exists():
+                csv_path, _ = resolve_candle_path(quarter_dir, symbol, BASE_TIMEFRAME)
+                if csv_path is None:
                     continue
-                try:
-                    df = _read_candles_csv(csv_path)
-                except Exception:
-                    continue
-                if start_ts is not None:
-                    df = df[df["dt"] >= start_ts]
-                if end_ts is not None:
-                    df = df[df["dt"] <= end_ts]
-                if len(df) == 0:
-                    continue
-                frames.setdefault(symbol, []).append(df)
+                tasks.append((symbol, csv_path))
+
+    def _load_task(task: tuple[str, Path]) -> tuple[str, pd.DataFrame] | None:
+        symbol, csv_path = task
+        try:
+            df = _read_candles_csv(csv_path)
+        except Exception:
+            return None
+        if start_ts is not None:
+            df = df[df["dt"] >= start_ts]
+        if end_ts is not None:
+            df = df[df["dt"] <= end_ts]
+        if len(df) == 0:
+            return None
+        return symbol, df
+
+    max_workers = max(1, io_workers or min(8, max(1, (os.cpu_count() or 4) // 2)))
+    if max_workers == 1 or len(tasks) <= 1:
+        loaded_items = (_load_task(task) for task in tasks)
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
+            loaded_items = pool.map(_load_task, tasks)
+
+    for item in loaded_items:
+        if item is None:
+            continue
+        symbol, df = item
+        frames.setdefault(symbol, []).append(df)
 
     merged: dict[str, pd.DataFrame] = {}
     for symbol, chunks in frames.items():
@@ -145,7 +171,42 @@ def _session_name(dt: pd.Timestamp) -> str:
     return "closed"
 
 
-def _resample_frame(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
+def encode_session_codes(timestamps: np.ndarray | pd.Index) -> np.ndarray:
+    dt_index = pd.DatetimeIndex(timestamps)
+    hours = dt_index.hour.to_numpy()
+    weekdays = dt_index.weekday.to_numpy()
+    session_codes = np.full(len(dt_index), SESSION_CODES["closed"], dtype=np.int8)
+    open_day = weekdays < 5
+    overlap = open_day & (hours >= 13) & (hours < 17)
+    tokyo = open_day & (hours >= 2) & (hours < 8)
+    london = open_day & (hours >= 8) & (hours < 13)
+    newyork = open_day & (hours >= 17) & (hours < 22)
+    session_codes[tokyo] = SESSION_CODES["tokyo"]
+    session_codes[london] = SESSION_CODES["london"]
+    session_codes[newyork] = SESSION_CODES["newyork"]
+    session_codes[overlap] = SESSION_CODES["overlap"]
+    return session_codes
+
+
+def _build_base_index(base_frames: dict[str, pd.DataFrame], fill_policy: str) -> pd.Index:
+    if fill_policy == FILL_POLICY_MASK:
+        starts = [frame.index.min() for frame in base_frames.values()]
+        ends = [frame.index.max() for frame in base_frames.values()]
+        return pd.date_range(min(starts), max(ends), freq=TIMEFRAME_FREQ[BASE_TIMEFRAME], name="dt")
+    return pd.Index(sorted({ts for frame in base_frames.values() for ts in frame.index}), name="dt")
+
+
+def _build_resample_index(base_index: pd.Index, tf_name: str) -> pd.DatetimeIndex:
+    reference = pd.Series(np.ones(len(base_index), dtype=np.int8), index=pd.DatetimeIndex(base_index))
+    return reference.resample(TIMEFRAME_FREQ[tf_name], label="right", closed="right").max().index
+
+
+def _resample_frame(
+    df: pd.DataFrame,
+    tf_name: str,
+    keep_calendar_gaps: bool = False,
+    target_index: pd.DatetimeIndex | None = None,
+) -> pd.DataFrame:
     freq = TIMEFRAME_FREQ[tf_name]
     agg = df.resample(freq, label="right", closed="right").agg({
         "o": "first",
@@ -156,7 +217,10 @@ def _resample_frame(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         "tk": "sum",
         "real": "max",
     })
-    agg = agg.dropna(subset=["c"])
+    if target_index is not None:
+        agg = agg.reindex(target_index)
+    if not keep_calendar_gaps:
+        agg = agg.dropna(subset=["c"])
     return agg
 
 
@@ -173,41 +237,63 @@ def _frame_to_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     }
 
 
+def _align_base_frame_with_policy(frame: pd.DataFrame, base_index: pd.Index, fill_policy: str) -> pd.DataFrame:
+    aligned = frame.reindex(base_index).copy()
+    real_mask = aligned["c"].notna().to_numpy(dtype=np.bool_)
+    if fill_policy == FILL_POLICY_CARRY:
+        price_cols = ["o", "h", "l", "c"]
+        aligned[price_cols] = aligned[price_cols].ffill().bfill()
+    elif fill_policy != FILL_POLICY_MASK:
+        raise ValueError(f"Unsupported fill_policy={fill_policy!r}; expected one of {sorted(VALID_FILL_POLICIES)}")
+    aligned["sp"] = aligned["sp"].fillna(0.0)
+    aligned["tk"] = aligned["tk"].fillna(0.0)
+    aligned["real"] = real_mask
+    return aligned
+
+
 def load_canonical_research_dataset(
     data_root: str,
     symbols: Iterable[str] | None = None,
     start: str | None = None,
     end: str | None = None,
+    io_workers: int | None = None,
+    fill_policy: str = FILL_POLICY_CARRY,
 ) -> CanonicalResearchDataset:
     root = Path(data_root)
-    base_frames = _load_base_frames(root, symbols=symbols, start=start, end=end)
+    if fill_policy not in VALID_FILL_POLICIES:
+        raise ValueError(f"Unsupported fill_policy={fill_policy!r}; expected one of {sorted(VALID_FILL_POLICIES)}")
+    base_frames = _load_base_frames(root, symbols=symbols, start=start, end=end, io_workers=io_workers)
     if not base_frames:
         raise ValueError(f"No {BASE_TIMEFRAME} data found under {data_root}")
 
-    base_index = pd.Index(sorted({ts for frame in base_frames.values() for ts in frame.index}))
+    base_index = _build_base_index(base_frames, fill_policy=fill_policy)
     tf_data: dict[str, dict[str, dict[str, np.ndarray]]] = {tf: {} for tf in RESEARCH_TIMEFRAMES}
+    target_resample_indices = {
+        tf_name: _build_resample_index(base_index, tf_name)
+        for tf_name in DERIVED_TIMEFRAMES
+    }
 
     for symbol, frame in base_frames.items():
-        aligned = frame.reindex(base_index)
-        real_mask = aligned["c"].notna().to_numpy()
-        aligned = aligned.ffill().dropna(subset=["c"]).copy()
-        real_mask = real_mask[len(real_mask) - len(aligned):]
-        aligned["real"] = real_mask
-        aligned["sp"] = aligned["sp"].fillna(0.0)
-        aligned["tk"] = aligned["tk"].fillna(0.0)
+        aligned = _align_base_frame_with_policy(frame, base_index, fill_policy=fill_policy)
         tf_data[BASE_TIMEFRAME][symbol] = _frame_to_arrays(aligned)
 
         aligned_df = aligned[["o", "h", "l", "c", "sp", "tk", "real"]]
         for tf_name in DERIVED_TIMEFRAMES:
-            resampled = _resample_frame(aligned_df, tf_name)
+            resampled = _resample_frame(
+                aligned_df,
+                tf_name,
+                keep_calendar_gaps=fill_policy == FILL_POLICY_MASK,
+                target_index=target_resample_indices[tf_name] if fill_policy == FILL_POLICY_MASK else None,
+            )
             tf_data[tf_name][symbol] = _frame_to_arrays(resampled)
 
     base_any_symbol = next(iter(tf_data[BASE_TIMEFRAME].values()))
     base_timestamps = base_any_symbol["dt"]
     base_dt_index = pd.Index(base_timestamps)
-    session_names = np.array([_session_name(pd.Timestamp(ts)) for ts in base_timestamps], dtype=object)
-    session_codes = np.array([SESSION_CODES[name] for name in session_names], dtype=np.int8)
-    quarter_ids = np.array([f"{pd.Timestamp(ts).year}-Q{((pd.Timestamp(ts).month - 1) // 3) + 1}" for ts in base_timestamps], dtype=object)
+    dt_index = pd.DatetimeIndex(base_timestamps)
+    session_codes = encode_session_codes(base_timestamps)
+    session_names = np.array([SESSION_NAMES[idx] for idx in session_codes], dtype=object)
+    quarter_ids = dt_index.to_period("Q").astype(str).to_numpy(dtype=object)
 
     tf_index_for_base: dict[str, np.ndarray] = {}
     for tf_name in RESEARCH_TIMEFRAMES:
@@ -223,6 +309,7 @@ def load_canonical_research_dataset(
     return CanonicalResearchDataset(
         base_timeframe=BASE_TIMEFRAME,
         timeframes=RESEARCH_TIMEFRAMES,
+        fill_policy=fill_policy,
         tf_data=tf_data,
         base_timestamps=base_timestamps,
         session_codes=session_codes,
