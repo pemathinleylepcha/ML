@@ -12,4 +12,6 @@ __pycache__/
 DOC/*.md
 DOC/**/*.md
 DOC/IDEA-GRPO/
+/dashboard/
+DOC/compreseed/files.zip
 /README.md
