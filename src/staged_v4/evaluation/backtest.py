@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +25,14 @@ class _OpenPosition:
     tp_price: float
     sl_price: float
     confidence: float
+    entry_atr: float
+
+
+def adjusted_backtest_config(cfg: BacktestConfig, val_ece: float | None = None) -> BacktestConfig:
+    adjusted = deepcopy(cfg)
+    if adjusted.ece_gate_threshold > 0.0 and val_ece is not None and val_ece > adjusted.ece_gate_threshold:
+        adjusted.max_positions = max(2, adjusted.max_positions // 2)
+    return adjusted
 
 
 def _sharpe(returns: np.ndarray) -> float:
@@ -59,6 +68,29 @@ def _trade_confidence(prob_buy: float, direction: int, entry_prob: float | None 
         return float(directional_conf)
     entry_conf = entry_prob if direction == 1 else (1.0 - entry_prob)
     return float(min(directional_conf, entry_conf))
+
+
+def _sanitize_entry_atr(raw_atr: float, reference_price: float, cfg: BacktestConfig) -> float:
+    capped = cfg.max_entry_atr_pct * max(abs(reference_price), 1e-8)
+    return float(max(min(raw_atr, capped), 1e-8))
+
+
+def _apply_entry_slippage(entry_price: float, direction: int, entry_atr: float, cfg: BacktestConfig) -> float:
+    slip = cfg.slippage_atr * entry_atr
+    if direction == 1:
+        return float(entry_price + slip)
+    return float(entry_price - slip)
+
+
+def _apply_stop_slippage(stop_price: float, direction: int, entry_atr: float, cfg: BacktestConfig) -> float:
+    slip = cfg.slippage_atr * entry_atr
+    if direction == 1:
+        return float(stop_price - slip)
+    return float(stop_price + slip)
+
+
+def _is_breakeven_stop(position: _OpenPosition) -> bool:
+    return abs(position.sl_price - position.entry_price) <= max(1e-8, abs(position.entry_price) * 1e-8)
 
 
 def _build_threshold_diagnostics(confidences: list[float], returns: list[float]) -> list[dict[str, float | int]]:
@@ -139,6 +171,16 @@ def backtest_probabilities(
             lo = float(low[t, position.node_idx])
             cls = float(close[t, position.node_idx])
 
+            if cfg.trailing_activate_atr > 0.0:
+                if position.direction == 1:
+                    unrealized_atr = (hi - position.entry_price) / max(position.entry_atr, 1e-8)
+                    if unrealized_atr >= cfg.trailing_activate_atr:
+                        position.sl_price = max(position.sl_price, position.entry_price)
+                else:
+                    unrealized_atr = (position.entry_price - lo) / max(position.entry_atr, 1e-8)
+                    if unrealized_atr >= cfg.trailing_activate_atr:
+                        position.sl_price = min(position.sl_price, position.entry_price)
+
             if position.direction == 1:
                 hit_tp = hi >= position.tp_price
                 hit_sl = lo <= position.sl_price
@@ -156,14 +198,14 @@ def backtest_probabilities(
                     exit_price = position.tp_price
                     exit_reason = "tp_sl_same_bar_tp"
                 else:
-                    exit_price = position.sl_price
-                    exit_reason = "tp_sl_same_bar_sl"
+                    exit_price = _apply_stop_slippage(position.sl_price, position.direction, position.entry_atr, cfg)
+                    exit_reason = "trailing_breakeven" if _is_breakeven_stop(position) else "tp_sl_same_bar_sl"
             elif hit_tp:
                 exit_price = position.tp_price
                 exit_reason = "take_profit"
             elif hit_sl:
-                exit_price = position.sl_price
-                exit_reason = "stop_loss"
+                exit_price = _apply_stop_slippage(position.sl_price, position.direction, position.entry_atr, cfg)
+                exit_reason = "trailing_breakeven" if _is_breakeven_stop(position) else "stop_loss"
             elif (t - position.entry_bar) >= cfg.max_hold_bars:
                 exit_price = cls
                 exit_reason = "horizon_exit"
@@ -219,7 +261,9 @@ def backtest_probabilities(
                 continue
 
             entry_bar = t + cfg.latency_bars
-            entry_atr = float(max(atr[entry_bar, node_idx], 1e-8))
+            raw_atr = float(max(atr[entry_bar, node_idx], 1e-8))
+            reference_price = float(close[entry_bar, node_idx])
+            entry_atr = _sanitize_entry_atr(raw_atr, reference_price, cfg)
             if cfg.use_limit_entries:
                 limit_price = float(close[t, node_idx]) - direction * cfg.limit_offset_atr * entry_atr
                 if direction == 1:
@@ -231,13 +275,18 @@ def backtest_probabilities(
                 entry_price = limit_price
             else:
                 entry_price = float(close[entry_bar, node_idx])
+            entry_price = _apply_entry_slippage(entry_price, direction, entry_atr, cfg)
+
+            atr_stop_dist = cfg.stop_loss_atr * entry_atr
+            pct_stop_dist = cfg.max_loss_pct_per_trade * max(abs(entry_price), 1e-8)
+            stop_dist = min(atr_stop_dist, pct_stop_dist)
 
             if direction == 1:
                 tp_price = entry_price + cfg.take_profit_atr * entry_atr
-                sl_price = entry_price - cfg.stop_loss_atr * entry_atr
+                sl_price = entry_price - stop_dist
             else:
                 tp_price = entry_price - cfg.take_profit_atr * entry_atr
-                sl_price = entry_price + cfg.stop_loss_atr * entry_atr
+                sl_price = entry_price + stop_dist
 
             open_positions.append(
                 _OpenPosition(
@@ -250,6 +299,7 @@ def backtest_probabilities(
                     tp_price=tp_price,
                     sl_price=sl_price,
                     confidence=_trade_confidence(p, direction, entry_probability),
+                    entry_atr=entry_atr,
                 )
             )
             active_pairs.append(pair_names[node_idx])

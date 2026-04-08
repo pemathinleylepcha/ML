@@ -23,6 +23,13 @@ _JIT_TPO_LOOKBACK = 192
 _JIT_LAPLACIAN_LOOKBACK = 60
 
 
+def _to_device(arr: np.ndarray, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    cpu_tensor = torch.from_numpy(np.ascontiguousarray(arr)).to(dtype=dtype)
+    if device.type == "cuda":
+        return cpu_tensor.pin_memory().to(device, non_blocking=True)
+    return cpu_tensor.to(device)
+
+
 def _pad_window(values: np.ndarray, seq_len: int, fill_value=0) -> np.ndarray:
     out = np.full((seq_len,) + values.shape[1:], fill_value, dtype=values.dtype)
     if len(values):
@@ -235,16 +242,16 @@ def build_btc_sequence_batch_from_panels(
             node_names=(symbol,),
             tradable_indices=(0,),
             timestamps=timestamps,
-            node_features=torch.tensor(node_features, dtype=torch.float32, device=device),
-            tpo_features=torch.tensor(tpo_features, dtype=torch.float32, device=device),
-            volatility=torch.tensor(volatility, dtype=torch.float32, device=device),
-            valid_mask=torch.tensor(valid_mask, dtype=torch.bool, device=device),
-            market_open_mask=torch.tensor(market_open_mask, dtype=torch.bool, device=device),
-            overlap_mask=torch.tensor(overlap_mask, dtype=torch.bool, device=device),
-            session_codes=torch.tensor(session_codes, dtype=torch.long, device=device),
-            direction_labels=torch.tensor(direction_labels, dtype=torch.float32, device=device),
-            entry_labels=torch.tensor(entry_labels, dtype=torch.float32, device=device),
-            label_valid_mask=torch.tensor(label_valid_mask, dtype=torch.bool, device=device),
+            node_features=_to_device(node_features, torch.float32, device),
+            tpo_features=_to_device(tpo_features, torch.float32, device),
+            volatility=_to_device(volatility, torch.float32, device),
+            valid_mask=_to_device(valid_mask, torch.bool, device),
+            market_open_mask=_to_device(market_open_mask, torch.bool, device),
+            overlap_mask=_to_device(overlap_mask, torch.bool, device),
+            session_codes=_to_device(session_codes, torch.long, device),
+            direction_labels=_to_device(direction_labels, torch.float32, device),
+            entry_labels=_to_device(entry_labels, torch.float32, device),
+            label_valid_mask=_to_device(label_valid_mask, torch.bool, device),
         )
 
     return SubnetSequenceBatch(
@@ -435,16 +442,16 @@ def build_fx_sequence_batch_from_panels(
             node_names=symbols,
             tradable_indices=tradable_indices,
             timestamps=timestamps,
-            node_features=torch.tensor(node_features, dtype=torch.float32, device=device),
-            tpo_features=torch.tensor(tpo_features, dtype=torch.float32, device=device),
-            volatility=torch.tensor(volatility, dtype=torch.float32, device=device),
-            valid_mask=torch.tensor(valid_mask, dtype=torch.bool, device=device),
-            market_open_mask=torch.tensor(market_open_mask, dtype=torch.bool, device=device),
-            overlap_mask=torch.tensor(overlap_mask, dtype=torch.bool, device=device),
-            session_codes=torch.tensor(session_codes, dtype=torch.long, device=device),
-            direction_labels=torch.tensor(direction_labels, dtype=torch.float32, device=device),
-            entry_labels=torch.tensor(entry_labels, dtype=torch.float32, device=device),
-            label_valid_mask=torch.tensor(label_valid_mask, dtype=torch.bool, device=device),
+            node_features=_to_device(node_features, torch.float32, device),
+            tpo_features=_to_device(tpo_features, torch.float32, device),
+            volatility=_to_device(volatility, torch.float32, device),
+            valid_mask=_to_device(valid_mask, torch.bool, device),
+            market_open_mask=_to_device(market_open_mask, torch.bool, device),
+            overlap_mask=_to_device(overlap_mask, torch.bool, device),
+            session_codes=_to_device(session_codes, torch.long, device),
+            direction_labels=_to_device(direction_labels, torch.float32, device),
+            entry_labels=_to_device(entry_labels, torch.float32, device),
+            label_valid_mask=_to_device(label_valid_mask, torch.bool, device),
         )
 
     return SubnetSequenceBatch(

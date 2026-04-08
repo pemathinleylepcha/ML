@@ -251,7 +251,7 @@ def build_fx_timeframe_batch(
         tick[:, col_idx] = frame["tk"].fillna(0.0).to_numpy(dtype=np.float32)
         valid_mask[:, col_idx] = frame["real"].fillna(False).to_numpy(dtype=np.bool_)
 
-    requested_workers = max_workers if max_workers and max_workers > 0 else min(8, max(2, (os.cpu_count() or 8) // 2))
+    requested_workers = max_workers if max_workers and max_workers > 0 else min(16, max(4, (os.cpu_count() or 8) // 2))
     worker_count = max(1, min(total_symbols, requested_workers))
     future_specs = []
     if shard_dir is not None:

@@ -112,7 +112,7 @@ class SubnetConfig:
 @dataclass(slots=True)
 class TrainingConfig:
     anchor_timeframe: str = "M1"
-    batch_size: int = 8
+    batch_size: int = 16
     epochs_stage1: int = 2
     epochs_stage2: int = 2
     epochs_stage3: int = 1
@@ -122,23 +122,35 @@ class TrainingConfig:
     split_frequency: str = "week"
     outer_holdout_blocks: int = 1
     min_train_blocks: int = 2
+    label_smooth: float = 0.10
+    memory_guard_min_available_mb: float = 4096.0
+    memory_guard_critical_available_mb: float = 2048.0
+    memory_guard_check_interval: int = 25
+    use_torch_compile: bool = True
+    gpu_memory_guard_min_mb: float = 4096.0
+    gpu_memory_guard_critical_mb: float = 2048.0
 
 
 @dataclass(slots=True)
 class BacktestConfig:
-    base_entry_threshold: float = 0.60
+    base_entry_threshold: float = 0.65
     threshold_volatility_coeff: float = 12.0
     exit_threshold: float = 0.52
-    probability_spread_threshold: float = 0.10
+    probability_spread_threshold: float = 0.15
     latency_bars: int = 1
     cooldown_bars: int = 3
     max_positions: int = 6
     max_hold_bars: int = 6
-    entry_gate_threshold: float = 0.50
-    max_confidence_threshold: float = 0.70
+    entry_gate_threshold: float = 0.55
+    max_confidence_threshold: float = 1.01
     max_group_exposure: int = 2
     take_profit_atr: float = 1.00
     stop_loss_atr: float = 0.70
+    max_loss_pct_per_trade: float = 0.005
+    max_entry_atr_pct: float = 0.01
+    slippage_atr: float = 0.01
+    ece_gate_threshold: float = 0.0
+    trailing_activate_atr: float = 0.50
     use_limit_entries: bool = True
     limit_offset_atr: float = 0.10
 

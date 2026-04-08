@@ -5,10 +5,13 @@ import logging
 import tempfile
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import torch
+from torch import nn
 
 import staged_v4.data.fx_features as fx_features_module
 from tick_resampler import parse_tick_csv, resample_to_1000ms, stream_resample_tick_csv
@@ -28,11 +31,20 @@ from staged_v4.data import (
 from staged_v4.data.fx_features import _build_symbol_aux_features, build_fx_timeframe_batch
 from staged_v4.data.dataset import _presweep_tpo, _read_tick_frame, _resample_frame, _stream_resample_tick_source
 from staged_v4.data.dataset import _load_symbol_timeframe
-from staged_v4.evaluation.backtest import backtest_probabilities
+from staged_v4.data.jit_sequences import _to_device
+from staged_v4.evaluation.backtest import adjusted_backtest_config, backtest_probabilities
 from staged_v4.models import BTCSubnet, ConditionalBridge, STGNNBlock
-from staged_v4.training.train_staged import _build_edge_tensors, _build_subnet_sequence_batch, _resolve_cached_splits, run_staged_experiment
+from staged_v4.training.train_staged import (
+    _build_edge_tensors,
+    _build_subnet_sequence_batch,
+    _compute_subnet_loss,
+    _gpu_memory_state,
+    _resolve_cached_splits,
+    run_staged_experiment,
+)
 from staged_v4.utils.calibration_helpers import apply_platt_scaler, fit_platt_scaler
 from staged_v4.utils.graph_helpers import rolling_correlation_adjacency
+from staged_v4.utils import runtime_logging as runtime_logging_module
 
 
 def test_synthetic_panels_cover_all_timeframes() -> None:
@@ -168,6 +180,102 @@ def test_rolling_correlation_adjacency_ignores_constant_columns_without_warning(
     assert not any("invalid value encountered in divide" in str(item.message) for item in caught)
 
 
+def test_memory_guard_reduces_workers_when_available_memory_is_low() -> None:
+    with patch.object(runtime_logging_module, "runtime_snapshot", return_value={"system_mem_available_mb": 3000.0}):
+        workers, guard = runtime_logging_module.guard_worker_budget(
+            16,
+            min_available_mb=4096.0,
+            critical_available_mb=2048.0,
+        )
+    assert workers == 2
+    assert guard["state"] == "low"
+
+
+def test_gpu_memory_state_is_safe_on_cpu() -> None:
+    guard = _gpu_memory_state(
+        torch.device("cpu"),
+        min_available_mb=4096.0,
+        critical_available_mb=2048.0,
+    )
+    assert guard["state"] == "ok"
+    assert guard["vram_free_mb"] is None
+    assert guard["vram_total_mb"] is None
+
+
+def test_memory_guard_raises_when_available_memory_is_critical() -> None:
+    logger = logging.getLogger("memory_guard_test")
+    with patch.object(runtime_logging_module, "runtime_snapshot", return_value={"system_mem_available_mb": 1024.0}):
+        try:
+            runtime_logging_module.enforce_memory_guard(
+                logger,
+                None,
+                "unit_test",
+                min_available_mb=4096.0,
+                critical_available_mb=2048.0,
+                raise_on_critical=True,
+            )
+        except MemoryError as exc:
+            assert "critical_available_mb" in str(exc)
+        else:
+            raise AssertionError("Expected MemoryError from critical memory guard state")
+
+
+def test_jit_to_device_preserves_values_on_cpu() -> None:
+    arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    tensor = _to_device(arr, torch.float32, torch.device("cpu"))
+    assert tensor.device.type == "cpu"
+    assert tensor.dtype == torch.float32
+    np.testing.assert_allclose(tensor.numpy(), arr)
+
+
+def test_pushgateway_metrics_render_training_progress() -> None:
+    payload = {
+        "runtime": {
+            "hostname": "thinley",
+            "rss_mb": 512.0,
+            "system_mem_available_mb": 8192.0,
+        },
+        "state": "running",
+        "stage": "stage2_fx",
+        "fold": 1,
+        "fold_total": 2,
+        "progress": {"current": 12, "total": 24, "ratio": 0.5},
+        "details": {"epoch": 1},
+    }
+    rendered = runtime_logging_module._render_pushgateway_metrics(
+        r"D:\work\Algo-C2-Codex\data\remote_runs\demo_run\status.json",
+        payload,
+    ).decode("utf-8")
+    assert 'algoc2_training_status{run="demo_run",stage="stage2_fx",state="running",host="thinley"} 1.0' in rendered
+    assert 'algoc2_training_progress_ratio{run="demo_run",stage="stage2_fx",host="thinley"} 0.5' in rendered
+    assert 'algoc2_training_fold_total{run="demo_run",host="thinley"} 2.0' in rendered
+    assert 'algoc2_training_runtime_rss_mb{run="demo_run",host="thinley"} 512.0' in rendered
+
+
+def test_pushgateway_metrics_render_training_throughput() -> None:
+    payload = {
+        "runtime": {
+            "hostname": "thinley",
+        },
+        "state": "running",
+        "stage": "stage2_fx",
+        "details": {
+            "batches": 128,
+            "elapsed_sec": 32.0,
+            "batches_per_sec": 4.0,
+            "batch_size": 16,
+        },
+    }
+    rendered = runtime_logging_module._render_pushgateway_metrics(
+        r"D:\work\Algo-C2-Codex\data\remote_runs\demo_run\status.json",
+        payload,
+    ).decode("utf-8")
+    assert 'algoc2_training_stage_batches{run="demo_run",stage="stage2_fx",host="thinley"} 128.0' in rendered
+    assert 'algoc2_training_stage_elapsed_sec{run="demo_run",stage="stage2_fx",host="thinley"} 32.0' in rendered
+    assert 'algoc2_training_stage_batches_per_sec{run="demo_run",stage="stage2_fx",host="thinley"} 4.0' in rendered
+    assert 'algoc2_training_stage_batch_size{run="demo_run",stage="stage2_fx",host="thinley"} 16.0' in rendered
+
+
 def test_backtest_tp_exit_and_position_cap() -> None:
     prob_buy = np.array(
         [
@@ -216,8 +324,11 @@ def test_backtest_tp_exit_and_position_cap() -> None:
         max_positions=1,
         max_hold_bars=6,
         entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
         take_profit_atr=0.35,
         stop_loss_atr=0.35,
+        max_loss_pct_per_trade=0.05,
+        slippage_atr=0.0,
         use_limit_entries=False,
     )
     result = backtest_probabilities(
@@ -233,7 +344,7 @@ def test_backtest_tp_exit_and_position_cap() -> None:
     )
     assert result["trade_count"] == 1
     assert result["max_open_positions"] == 1
-    assert result["exit_reason_counts"]["take_profit"] == 1
+    assert any(reason in result["exit_reason_counts"] for reason in ("take_profit", "tp_sl_same_bar_tp"))
     assert result["win_rate"] == 1.0
 
 
@@ -252,6 +363,9 @@ def test_backtest_entry_gate_blocks_low_entry_prob() -> None:
         latency_bars=1,
         max_positions=1,
         entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
+        max_loss_pct_per_trade=0.05,
+        slippage_atr=0.0,
         use_limit_entries=False,
     )
     result = backtest_probabilities(
@@ -266,6 +380,45 @@ def test_backtest_entry_gate_blocks_low_entry_prob() -> None:
         cfg,
     )
     assert result["trade_count"] == 0
+
+
+def test_backtest_trailing_stop_moves_to_breakeven() -> None:
+    prob_buy = np.array([[0.50], [0.82], [0.81], [0.51]], dtype=np.float32)
+    prob_entry = np.array([[0.50], [0.80], [0.80], [0.50]], dtype=np.float32)
+    close = np.array([[100.0], [100.0], [100.0], [100.1]], dtype=np.float32)
+    high = np.array([[100.5], [100.5], [100.5], [100.6]], dtype=np.float32)
+    low = np.array([[99.5], [99.5], [99.5], [99.9]], dtype=np.float32)
+    volatility = np.full_like(prob_buy, 0.001)
+    session_codes = np.ones(prob_buy.shape[0], dtype=np.int64)
+    cfg = BacktestConfig(
+        base_entry_threshold=0.57,
+        threshold_volatility_coeff=0.0,
+        probability_spread_threshold=0.05,
+        latency_bars=1,
+        max_positions=1,
+        entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
+        take_profit_atr=2.0,
+        stop_loss_atr=0.7,
+        max_loss_pct_per_trade=0.05,
+        trailing_activate_atr=0.5,
+        slippage_atr=0.0,
+        use_limit_entries=False,
+    )
+    result = backtest_probabilities(
+        prob_buy,
+        prob_entry,
+        close,
+        high,
+        low,
+        volatility,
+        session_codes,
+        ("EURUSD",),
+        cfg,
+    )
+    assert result["trade_count"] == 1
+    assert result["exit_reason_counts"]["trailing_breakeven"] == 1
+    assert abs(result["net_return"]) < 1e-9
 
 
 def test_backtest_caps_inverted_high_confidence_trades() -> None:
@@ -284,6 +437,8 @@ def test_backtest_caps_inverted_high_confidence_trades() -> None:
         max_positions=1,
         entry_gate_threshold=0.50,
         max_confidence_threshold=0.70,
+        max_loss_pct_per_trade=0.05,
+        slippage_atr=0.0,
         use_limit_entries=False,
     )
     result = backtest_probabilities(
@@ -298,6 +453,177 @@ def test_backtest_caps_inverted_high_confidence_trades() -> None:
         cfg,
     )
     assert result["trade_count"] == 0
+
+
+def test_compute_subnet_loss_applies_label_smoothing() -> None:
+    logits = torch.tensor([[2.0, -2.0]], dtype=torch.float32)
+    entry_logits = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    direction_labels = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    entry_labels = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    valid_mask = torch.tensor([[True, True]], dtype=torch.bool)
+    subnet_state = SimpleNamespace(
+        timeframe_states={
+            "M1": SimpleNamespace(
+                directional_logits=logits,
+                entry_logits=entry_logits,
+            )
+        }
+    )
+    sequence_batch = SimpleNamespace(
+        timeframe_batches={
+            "M1": SimpleNamespace(
+                direction_labels=direction_labels,
+                entry_labels=entry_labels,
+                label_valid_mask=valid_mask,
+                tradable_indices=(0, 1),
+            )
+        }
+    )
+    smooth = 0.10
+    loss = _compute_subnet_loss(
+        subnet_state,
+        sequence_batch,
+        active_timeframe="M1",
+        active_boost=1.0,
+        label_smooth=smooth,
+    )
+    smoothed_targets = direction_labels * (1.0 - smooth) + 0.5 * smooth
+    smoothed_entry_targets = entry_labels * (1.0 - smooth) + 0.5 * smooth
+    expected = nn.BCEWithLogitsLoss()(logits[valid_mask], smoothed_targets[valid_mask]) + 0.5 * nn.BCEWithLogitsLoss()(
+        entry_logits[valid_mask],
+        smoothed_entry_targets[valid_mask],
+    )
+    assert torch.allclose(loss, expected)
+
+
+def test_backtest_hard_loss_cap_limits_single_trade_drawdown() -> None:
+    prob_buy = np.array([[0.50], [0.82], [0.81], [0.50]], dtype=np.float32)
+    prob_entry = np.array([[0.50], [0.80], [0.80], [0.50]], dtype=np.float32)
+    close = np.array([[100.0], [100.0], [100.0], [100.0]], dtype=np.float32)
+    high = np.array([[100.0], [105.0], [105.0], [100.0]], dtype=np.float32)
+    low = np.array([[100.0], [95.0], [95.0], [99.0]], dtype=np.float32)
+    volatility = np.full_like(prob_buy, 0.001)
+    session_codes = np.ones(prob_buy.shape[0], dtype=np.int64)
+    cfg = BacktestConfig(
+        base_entry_threshold=0.57,
+        threshold_volatility_coeff=0.0,
+        probability_spread_threshold=0.05,
+        latency_bars=1,
+        max_positions=1,
+        entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
+        take_profit_atr=1.0,
+        stop_loss_atr=0.70,
+        max_loss_pct_per_trade=0.005,
+        slippage_atr=0.0,
+        use_limit_entries=False,
+    )
+    result = backtest_probabilities(
+        prob_buy,
+        prob_entry,
+        close,
+        high,
+        low,
+        volatility,
+        session_codes,
+        ("EURUSD",),
+        cfg,
+    )
+    assert result["trade_count"] == 1
+    assert result["exit_reason_counts"]["stop_loss"] == 1
+    assert result["net_return"] >= -0.00501
+    assert result["net_return"] <= -0.00499
+
+
+def test_backtest_sanitizes_entry_atr_for_take_profit_geometry() -> None:
+    prob_buy = np.array([[0.50], [0.82], [0.81], [0.50]], dtype=np.float32)
+    prob_entry = np.array([[0.50], [0.80], [0.80], [0.50]], dtype=np.float32)
+    close = np.array([[100.0], [100.0], [100.0], [100.0]], dtype=np.float32)
+    high = np.array([[100.0], [105.0], [100.0], [101.1]], dtype=np.float32)
+    low = np.array([[100.0], [95.0], [99.9], [99.9]], dtype=np.float32)
+    volatility = np.full_like(prob_buy, 0.001)
+    session_codes = np.ones(prob_buy.shape[0], dtype=np.int64)
+    cfg = BacktestConfig(
+        base_entry_threshold=0.57,
+        threshold_volatility_coeff=0.0,
+        probability_spread_threshold=0.05,
+        latency_bars=1,
+        max_positions=1,
+        entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
+        take_profit_atr=1.0,
+        stop_loss_atr=0.70,
+        max_loss_pct_per_trade=0.05,
+        max_entry_atr_pct=0.01,
+        slippage_atr=0.0,
+        use_limit_entries=False,
+    )
+    result = backtest_probabilities(
+        prob_buy,
+        prob_entry,
+        close,
+        high,
+        low,
+        volatility,
+        session_codes,
+        ("EURUSD",),
+        cfg,
+    )
+    assert result["trade_count"] == 1
+    assert any(reason in result["exit_reason_counts"] for reason in ("take_profit", "tp_sl_same_bar_tp"))
+    assert result["net_return"] > 0.0099
+
+
+def test_backtest_applies_slippage_on_entry_and_stop_loss() -> None:
+    prob_buy = np.array([[0.50], [0.82], [0.81], [0.50]], dtype=np.float32)
+    prob_entry = np.array([[0.50], [0.80], [0.80], [0.50]], dtype=np.float32)
+    close = np.array([[100.0], [100.0], [100.0], [100.0]], dtype=np.float32)
+    high = np.array([[100.0], [101.0], [101.0], [100.0]], dtype=np.float32)
+    low = np.array([[100.0], [99.0], [99.0], [99.0]], dtype=np.float32)
+    volatility = np.full_like(prob_buy, 0.001)
+    session_codes = np.ones(prob_buy.shape[0], dtype=np.int64)
+    cfg = BacktestConfig(
+        base_entry_threshold=0.57,
+        threshold_volatility_coeff=0.0,
+        probability_spread_threshold=0.05,
+        latency_bars=1,
+        max_positions=1,
+        entry_gate_threshold=0.50,
+        max_confidence_threshold=0.95,
+        take_profit_atr=2.0,
+        stop_loss_atr=0.50,
+        max_loss_pct_per_trade=0.05,
+        max_entry_atr_pct=0.01,
+        slippage_atr=0.05,
+        use_limit_entries=False,
+    )
+    result = backtest_probabilities(
+        prob_buy,
+        prob_entry,
+        close,
+        high,
+        low,
+        volatility,
+        session_codes,
+        ("EURUSD",),
+        cfg,
+    )
+    expected_entry = 100.0 + 0.05 * 1.0
+    expected_exit = (expected_entry - 0.50 * 1.0) - 0.05 * 1.0
+    expected_return = (expected_exit - expected_entry) / expected_entry
+    assert result["trade_count"] == 1
+    assert result["exit_reason_counts"]["stop_loss"] == 1
+    assert abs(result["net_return"] - expected_return) < 1e-6
+
+
+def test_adjusted_backtest_config_halves_positions_on_high_ece() -> None:
+    base_cfg = BacktestConfig(max_positions=6, ece_gate_threshold=0.09)
+    adjusted = adjusted_backtest_config(base_cfg, 0.105)
+    assert adjusted.max_positions == 3
+    unchanged = adjusted_backtest_config(base_cfg, 0.08)
+    assert unchanged.max_positions == 6
+    disabled = adjusted_backtest_config(BacktestConfig(max_positions=6, ece_gate_threshold=0.0), 0.50)
+    assert disabled.max_positions == 6
 
 
 def test_backtest_threshold_diagnostics_include_subthreshold_bucket() -> None:
@@ -666,7 +992,14 @@ def main() -> None:
         test_stgnn_block_shapes,
         test_cooperative_rotation,
         test_tpo_and_platt,
+        test_compute_subnet_loss_applies_label_smoothing,
         test_rolling_correlation_adjacency_ignores_constant_columns_without_warning,
+        test_memory_guard_reduces_workers_when_available_memory_is_low,
+        test_gpu_memory_state_is_safe_on_cpu,
+        test_memory_guard_raises_when_available_memory_is_critical,
+        test_jit_to_device_preserves_values_on_cpu,
+        test_pushgateway_metrics_render_training_progress,
+        test_pushgateway_metrics_render_training_throughput,
         test_large_tick_tpo_guard_skips_without_source,
         test_tpo_source_floor_uses_m5_for_tick_and_m1,
         test_jit_sequence_batches_match_prebuilt_batches_for_m1_m5,
@@ -674,8 +1007,17 @@ def main() -> None:
         test_cached_split_override_regenerates_more_folds,
         test_fx_shard_resume_roundtrip,
         test_fx_timeframe_batch_continues_after_symbol_exception,
+        test_backtest_trailing_stop_moves_to_breakeven,
         test_stream_resample_tick_checkpoint_matches_in_memory,
         test_stream_resample_tick_csv_matches_in_memory,
+        test_backtest_tp_exit_and_position_cap,
+        test_backtest_entry_gate_blocks_low_entry_prob,
+        test_backtest_caps_inverted_high_confidence_trades,
+        test_backtest_hard_loss_cap_limits_single_trade_drawdown,
+        test_backtest_sanitizes_entry_atr_for_take_profit_geometry,
+        test_backtest_applies_slippage_on_entry_and_stop_loss,
+        test_adjusted_backtest_config_halves_positions_on_high_ece,
+        test_backtest_threshold_diagnostics_include_subthreshold_bucket,
         test_smoke_train,
     ]
     for test in tests:

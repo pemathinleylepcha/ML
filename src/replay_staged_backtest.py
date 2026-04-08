@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, fields
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from staged_v4.config import BacktestConfig, FX_TRADABLE_NAMES, STGNNBlockConfig, SubnetConfig, TrainingConfig
+from staged_v4.contracts import CalibrationArtifact
+from staged_v4.data import load_staged_panels
+from staged_v4.evaluation.backtest import adjusted_backtest_config, backtest_probabilities
+from staged_v4.evaluation.metrics import (
+    binary_accuracy,
+    binary_auc,
+    binary_brier,
+    binary_ece,
+    binary_log_loss,
+    summarize_fold_metrics,
+)
+from staged_v4.models import BTCSubnet, ConditionalBridge, FXSubnet
+from staged_v4.training.train_staged import DEFAULT_SEQ_LENS, _collect_anchor_outputs
+from staged_v4.utils.calibration_helpers import apply_platt_scaler
+from staged_v4.utils.runtime_logging import configure_logging, log_exception, stage_context, write_status
+
+
+def _merge_dataclass_config(cls, payload: dict | None):
+    merged = {field.name: getattr(cls(), field.name) for field in fields(cls)}
+    if payload:
+        for key, value in payload.items():
+            if key in merged:
+                merged[key] = value
+    return cls(**merged)
+
+
+def replay_backtest(
+    run_dir: str,
+    candle_root: str,
+    tick_root: str | None,
+    start: str,
+    end: str,
+    output: str | None = None,
+    *,
+    strict: bool = False,
+    max_workers: int = 0,
+    device_override: str = "cpu",
+    log_file: str | None = None,
+    status_file: str | None = None,
+) -> dict:
+    run_path = Path(run_dir)
+    base_report_path = run_path / "report.json"
+    if not base_report_path.exists():
+        raise FileNotFoundError(f"Base report not found: {base_report_path}")
+    checkpoint_dir = run_path / "report"
+    checkpoint_paths = sorted(checkpoint_dir.glob("fold_*.pt"))
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No fold checkpoints found in {checkpoint_dir}")
+
+    logger = configure_logging("replay_staged_backtest", log_file=log_file)
+    base_report = json.loads(base_report_path.read_text(encoding="utf-8"))
+    training_cfg = _merge_dataclass_config(TrainingConfig, base_report.get("training_config"))
+    subnet_cfg = _merge_dataclass_config(SubnetConfig, base_report.get("subnet_config"))
+    block_cfg = _merge_dataclass_config(STGNNBlockConfig, base_report.get("block_config"))
+    # Replay should use the current execution defaults, not the stale saved ones,
+    # so execution-only bundles can be validated against frozen model checkpoints.
+    source_backtest_cfg = base_report.get("backtest_config", {})
+    backtest_cfg = BacktestConfig()
+    timeframes = tuple(base_report.get("timeframes", list(subnet_cfg.timeframe_order)))
+    if tuple(subnet_cfg.timeframe_order) != timeframes:
+        subnet_cfg = SubnetConfig(
+            timeframe_order=timeframes,
+            exchange_every_k_batches=subnet_cfg.exchange_every_k_batches,
+            active_loss_boost=subnet_cfg.active_loss_boost,
+            enable_entry_head=subnet_cfg.enable_entry_head,
+        )
+    include_signal_only_tpo = bool(base_report.get("include_signal_only_tpo", True))
+
+    resolved_device = device_override.lower()
+    if resolved_device == "auto":
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if resolved_device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available on this host")
+    device = torch.device(resolved_device)
+
+    with stage_context(
+        logger,
+        status_file,
+        "load_staged_panels",
+        candle_root=candle_root,
+        tick_root=tick_root,
+        start=start,
+        end=end,
+        max_workers=max_workers,
+        run_dir=str(run_path),
+    ):
+        btc_panels, fx_panels = load_staged_panels(
+            candle_root=candle_root,
+            tick_root=tick_root,
+            start=start,
+            end=end,
+            anchor_timeframe=training_cfg.anchor_timeframe,
+            strict=strict,
+            timeframes=timeframes,
+            split_frequency=training_cfg.split_frequency,
+            outer_holdout_blocks=training_cfg.outer_holdout_blocks,
+            min_train_blocks=training_cfg.min_train_blocks,
+            purge_bars=training_cfg.purge_bars,
+            logger=logger,
+            status_file=status_file,
+            max_workers=max_workers,
+            memory_guard_min_available_mb=training_cfg.memory_guard_min_available_mb,
+            memory_guard_critical_available_mb=training_cfg.memory_guard_critical_available_mb,
+        )
+
+    splits = list(fx_panels.walkforward_splits)
+    n_folds = min(len(checkpoint_paths), len(splits))
+    splits = splits[:n_folds]
+    checkpoint_paths = checkpoint_paths[:n_folds]
+    logger.info("state=replay_splits n_splits=%d checkpoints=%d device=%s", len(splits), len(checkpoint_paths), device.type)
+    write_status(status_file, {"state": "running", "stage": "replay_start", "fold_total": len(splits), "device": device.type})
+
+    fold_results: list[dict] = []
+    for fold_index, (split, checkpoint_path) in enumerate(zip(splits, checkpoint_paths)):
+        write_status(status_file, {"state": "running", "stage": "replay_fold", "fold": fold_index, "fold_total": len(splits)})
+        logger.info("fold=%d/%d state=start checkpoint=%s", fold_index + 1, len(splits), checkpoint_path.name)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        btc_subnet = BTCSubnet(subnet_cfg, block_cfg).to(device)
+        fx_subnet = FXSubnet(subnet_cfg, block_cfg).to(device)
+        bridge = ConditionalBridge(block_cfg.output_dim, block_cfg.hidden_dim).to(device)
+        btc_subnet.load_state_dict(checkpoint["btc_subnet"])
+        fx_subnet.load_state_dict(checkpoint["fx_subnet"])
+        bridge.load_state_dict(checkpoint["bridge"])
+        dir_scaler = CalibrationArtifact(**checkpoint["direction_scaler"])
+        entry_scaler = CalibrationArtifact(**checkpoint["entry_scaler"])
+
+        val_idx = np.asarray(split["val_idx"], dtype=np.int32)
+        (
+            val_dir_logits,
+            val_entry_logits,
+            val_dir_labels,
+            _val_entry_labels,
+            val_valid,
+            close,
+            high,
+            low,
+            volatility,
+            session_codes,
+        ) = _collect_anchor_outputs(
+            btc_subnet,
+            fx_subnet,
+            bridge,
+            btc_panels,
+            fx_panels,
+            val_idx,
+            DEFAULT_SEQ_LENS,
+            device,
+            include_signal_only_tpo=include_signal_only_tpo,
+        )
+        val_dir_logits_flat = val_dir_logits.reshape(-1)
+        val_entry_logits_flat = val_entry_logits.reshape(-1)
+        val_dir_labels_flat = val_dir_labels.reshape(-1)
+        val_valid_flat = val_valid.reshape(-1) & (val_dir_labels_flat >= 0)
+        val_prob_flat = apply_platt_scaler(dir_scaler, val_dir_logits_flat)
+        val_entry_prob_flat = apply_platt_scaler(entry_scaler, val_entry_logits_flat)
+        val_prob = val_prob_flat.reshape(val_dir_logits.shape)
+        val_entry_prob = val_entry_prob_flat.reshape(val_entry_logits.shape)
+        val_ece = binary_ece(val_prob_flat, val_dir_labels_flat, val_valid_flat)
+        fold_backtest_cfg = adjusted_backtest_config(backtest_cfg, val_ece)
+        backtest = backtest_probabilities(
+            val_prob,
+            val_entry_prob,
+            close,
+            high,
+            low,
+            volatility,
+            session_codes,
+            FX_TRADABLE_NAMES,
+            fold_backtest_cfg,
+        )
+        fold_result = {
+            "fold": int(split["fold"]),
+            "split_frequency": split.get("split_frequency", training_cfg.split_frequency),
+            "train_blocks": split.get("train_blocks", []),
+            "val_block": split.get("val_block", ""),
+            "auc": binary_auc(val_prob_flat, val_dir_labels_flat, val_valid_flat),
+            "log_loss": binary_log_loss(val_prob_flat, val_dir_labels_flat, val_valid_flat),
+            "brier": binary_brier(val_prob_flat, val_dir_labels_flat, val_valid_flat),
+            "ece": val_ece,
+            "directional_accuracy": binary_accuracy(val_prob_flat, val_dir_labels_flat, val_valid_flat),
+            "n_bars": int(len(val_idx)),
+            **{k: v for k, v in backtest.items() if k != "bar_returns"},
+            "backtest_cfg": asdict(fold_backtest_cfg),
+            "source_checkpoint": str(checkpoint_path),
+        }
+        fold_results.append(fold_result)
+        logger.info(
+            "fold=%d state=done auc=%.4f sharpe=%.4f net=%.4f trades=%d",
+            fold_index,
+            fold_result["auc"],
+            fold_result["strategy_sharpe"],
+            fold_result["net_return"],
+            fold_result["trade_count"],
+        )
+        write_status(status_file, {"state": "running", "stage": "replay_fold_complete", "fold": fold_index, "fold_result": fold_result})
+
+    summary = summarize_fold_metrics(fold_results)
+    baseline_mean_trade_count = float(base_report.get("summary", {}).get("mean_trade_count", 0.0))
+    replay_mean_trade_count = float(summary.get("mean_trade_count", 0.0))
+    trade_count_reduction = 0.0
+    if baseline_mean_trade_count > 0.0:
+        trade_count_reduction = 1.0 - (replay_mean_trade_count / baseline_mean_trade_count)
+    acceptance = {
+        "mean_trade_count_drop_gte_40pct": bool(trade_count_reduction >= 0.40),
+        "mean_sharpe_gte_6": bool(summary.get("mean_sharpe", -999.0) >= 6.0),
+        "worst_fold_sharpe_gt_neg2": bool(summary.get("worst_fold_sharpe", -999.0) > -2.0),
+        "all_fold_net_return_gt_neg1": bool(all(fr.get("net_return", -999.0) > -1.0 for fr in fold_results)),
+        "pbo_lt_0_55": bool((summary.get("pbo", 1.0) or 1.0) < 0.55),
+        "trade_count_reduction": float(trade_count_reduction),
+        "baseline_mean_trade_count": baseline_mean_trade_count,
+    }
+    replay_report = {
+        "mode": "replay_backtest",
+        "source_run_dir": str(run_path),
+        "source_report": str(base_report_path),
+        "candle_root": candle_root,
+        "tick_root": tick_root,
+        "start": start,
+        "end": end,
+        "timeframes": list(timeframes),
+        "training_config": asdict(training_cfg),
+        "subnet_config": asdict(subnet_cfg),
+        "block_config": asdict(block_cfg),
+        "backtest_config": asdict(backtest_cfg),
+        "source_backtest_config": source_backtest_cfg,
+        "include_signal_only_tpo": include_signal_only_tpo,
+        "fold_results": fold_results,
+        "summary": summary,
+        "acceptance": acceptance,
+        "baseline_summary": base_report.get("summary", {}),
+    }
+    output_path = Path(output) if output else (run_path / "report_bundle_c_replay.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(replay_report, indent=2), encoding="utf-8")
+    write_status(status_file, {"state": "completed", "stage": "replay_backtest", "summary": summary, "output": str(output_path), "acceptance": acceptance})
+    return replay_report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Replay staged_v4 backtests from saved fold checkpoints.")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--candle-root", required=True)
+    parser.add_argument("--tick-root", default=None)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--max-workers", type=int, default=0)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
+    parser.add_argument("--log-file", default=None)
+    parser.add_argument("--status-file", default=None)
+    args = parser.parse_args(argv)
+
+    try:
+        replay_backtest(
+            run_dir=args.run_dir,
+            candle_root=args.candle_root,
+            tick_root=args.tick_root,
+            start=args.start,
+            end=args.end,
+            output=args.output,
+            strict=args.strict,
+            max_workers=args.max_workers,
+            device_override=args.device,
+            log_file=args.log_file,
+            status_file=args.status_file,
+        )
+    except Exception as exc:
+        logger = configure_logging("replay_staged_backtest", log_file=args.log_file)
+        log_exception(logger, "replay_staged_backtest", exc, status_file=args.status_file)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

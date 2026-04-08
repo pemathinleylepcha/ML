@@ -11,7 +11,7 @@ import pandas as pd
 from dataextractor_contract import resolve_candle_path
 from research_dataset import _read_candles_csv, encode_session_codes
 from staged_v4.config import ALL_TIMEFRAMES, BTC_NODE_NAMES, FX_NODE_NAMES, LOWER_TIMEFRAME, TIMEFRAME_FREQ, TPO_SOURCE_TIMEFRAME
-from staged_v4.utils.runtime_logging import log_progress
+from staged_v4.utils.runtime_logging import enforce_memory_guard, guard_worker_budget, log_progress
 
 
 _CORE_COLS = ["o", "h", "l", "c", "sp", "tk", "real"]
@@ -351,6 +351,7 @@ def _presweep_tpo(
     symbols: tuple[str, ...],
     requested_timeframes: tuple[str, ...],
     logger=None,
+    max_workers: int = 0,
 ) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
     from staged_v4.data.tpo_features import compute_tpo_feature_panel
 
@@ -361,20 +362,35 @@ def _presweep_tpo(
             source_timeframes.add(source_timeframe)
 
     tpo_panels: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    cpu_total = os.cpu_count() or 8
+    worker_count = max_workers if max_workers and max_workers > 0 else min(24, max(4, cpu_total - 4))
     for source_timeframe in sorted(source_timeframes):
         symbol_frames = panels[source_timeframe]
         tpo_panels[source_timeframe] = {}
-        for symbol in symbols:
+        effective_workers = max(1, min(worker_count, len(symbols)))
+
+        def _one(symbol: str) -> tuple[str, tuple[np.ndarray, np.ndarray] | None]:
             frame = symbol_frames.get(symbol)
             if frame is None:
-                continue
+                return symbol, None
             high = frame["h"].fillna(0.0).to_numpy(dtype=np.float32)
             low = frame["l"].fillna(0.0).to_numpy(dtype=np.float32)
             close = frame["c"].fillna(0.0).to_numpy(dtype=np.float32)
-            features, volatility = compute_tpo_feature_panel(high, low, close)
-            tpo_panels[source_timeframe][symbol] = (features, volatility)
+            return symbol, compute_tpo_feature_panel(high, low, close)
+
+        with ThreadPoolExecutor(max_workers=effective_workers, thread_name_prefix=f"tpo_{source_timeframe}") as executor:
+            futures = [executor.submit(_one, symbol) for symbol in symbols]
+            for future in as_completed(futures):
+                symbol, result = future.result()
+                if result is not None:
+                    tpo_panels[source_timeframe][symbol] = result
         if logger is not None:
-            logger.info("state=tpo_presweep source_tf=%s symbols=%d", source_timeframe, len(tpo_panels[source_timeframe]))
+            logger.info(
+                "state=tpo_presweep source_tf=%s symbols=%d workers=%d",
+                source_timeframe,
+                len(tpo_panels[source_timeframe]),
+                effective_workers,
+            )
     return tpo_panels
 
 
@@ -447,16 +463,43 @@ def _load_panels_for_symbols(
     relevant_quarters: list[Path] | None = None,
     tick_file_map: dict[str, Path] | None = None,
     max_workers: int = 0,
+    memory_guard_min_available_mb: float = 0.0,
+    memory_guard_critical_available_mb: float = 0.0,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     active_timeframes = tuple(requested_timeframes or ALL_TIMEFRAMES)
     panels: dict[str, dict[str, pd.DataFrame]] = {}
     symbol_cache: dict[str, dict[str, pd.DataFrame]] = {symbol: {} for symbol in symbols}
     cpu_total = os.cpu_count() or 8
-    requested_workers = max_workers if max_workers and max_workers > 0 else min(16, max(4, cpu_total - 2))
+    requested_workers = max_workers if max_workers and max_workers > 0 else min(24, max(4, cpu_total - 4))
     for timeframe in active_timeframes:
         worker_count = max(1, min(len(symbols), requested_workers))
         if timeframe == "tick":
             worker_count = 1
+        if memory_guard_min_available_mb > 0.0 or memory_guard_critical_available_mb > 0.0:
+            guarded_workers, guard = guard_worker_budget(
+                worker_count,
+                min_available_mb=memory_guard_min_available_mb,
+                critical_available_mb=memory_guard_critical_available_mb,
+            )
+            if logger is not None and guarded_workers != worker_count:
+                logger.warning(
+                    "subnet=%s timeframe=%s state=memory_guard workers=%d->%d available_mb=%s",
+                    subnet_name,
+                    timeframe,
+                    worker_count,
+                    guarded_workers,
+                    guard["available_mb"],
+                )
+            worker_count = guarded_workers
+            if logger is not None:
+                enforce_memory_guard(
+                    logger,
+                    status_file,
+                    "load_panels",
+                    min_available_mb=memory_guard_min_available_mb,
+                    critical_available_mb=memory_guard_critical_available_mb,
+                    details={"subnet": subnet_name, "timeframe": timeframe, "workers": worker_count},
+                )
         if logger is not None:
             logger.info(
                 "subnet=%s timeframe=%s state=start symbols=%d workers=%d",
@@ -471,30 +514,89 @@ def _load_panels_for_symbols(
         if worker_count == 1:
             for idx, symbol in enumerate(symbols, start=1):
                 lower_frame = symbol_cache[symbol].get(lower_tf) if lower_tf else None
-                frame = _load_symbol_timeframe(
-                    candle_root,
-                    tick_root,
-                    symbol,
-                    timeframe,
-                    start,
-                    end,
-                    lower_frame=lower_frame,
-                    lower_timeframe=lower_tf,
-                    relevant_quarters=relevant_quarters,
-                    tick_file_map=tick_file_map,
-                    logger=logger,
-                )
+                if logger is not None:
+                    logger.info(
+                        "subnet=%s timeframe=%s symbol=%s state=start index=%d/%d",
+                        subnet_name,
+                        timeframe,
+                        symbol,
+                        idx,
+                        len(symbols),
+                    )
+                try:
+                    frame = _load_symbol_timeframe(
+                        candle_root,
+                        tick_root,
+                        symbol,
+                        timeframe,
+                        start,
+                        end,
+                        lower_frame=lower_frame,
+                        lower_timeframe=lower_tf,
+                        relevant_quarters=relevant_quarters,
+                        tick_file_map=tick_file_map,
+                        logger=logger,
+                    )
+                except Exception:
+                    if logger is not None:
+                        logger.exception(
+                            "subnet=%s timeframe=%s symbol=%s state=failed index=%d/%d",
+                            subnet_name,
+                            timeframe,
+                            symbol,
+                            idx,
+                            len(symbols),
+                        )
+                    raise
                 if frame is None:
+                    if logger is not None:
+                        logger.warning(
+                            "subnet=%s timeframe=%s symbol=%s state=missing index=%d/%d",
+                            subnet_name,
+                            timeframe,
+                            symbol,
+                            idx,
+                            len(symbols),
+                        )
                     if strict:
                         raise FileNotFoundError(f"Missing {timeframe} data for {symbol}")
                     continue
                 symbol_cache[symbol][timeframe] = frame
                 per_symbol[symbol] = frame
-                if logger is not None and (idx == len(symbols) or idx % 5 == 0):
+                if logger is not None:
+                    logger.info(
+                        "subnet=%s timeframe=%s symbol=%s state=done index=%d/%d rows=%d start=%s end=%s",
+                        subnet_name,
+                        timeframe,
+                        symbol,
+                        idx,
+                        len(symbols),
+                        len(frame),
+                        frame.index[0] if len(frame) else None,
+                        frame.index[-1] if len(frame) else None,
+                    )
+                    if memory_guard_min_available_mb > 0.0 or memory_guard_critical_available_mb > 0.0:
+                        enforce_memory_guard(
+                            logger,
+                            status_file,
+                            "load_panels",
+                            min_available_mb=memory_guard_min_available_mb,
+                            critical_available_mb=memory_guard_critical_available_mb,
+                            details={"subnet": subnet_name, "timeframe": timeframe, "symbol": symbol, "index": idx, "workers": worker_count},
+                        )
+                if logger is not None:
                     log_progress(logger, status_file, "load_panels", idx, len(symbols), subnet=subnet_name, timeframe=timeframe, valid_symbols=len(per_symbol), workers=worker_count)
         else:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=f"{subnet_name}_{timeframe}") as executor:
                 for symbol in symbols:
+                    if logger is not None:
+                        logger.info(
+                            "subnet=%s timeframe=%s symbol=%s state=queued workers=%d",
+                            subnet_name,
+                            timeframe,
+                            symbol,
+                            worker_count,
+                        )
                     lower_frame = symbol_cache[symbol].get(lower_tf) if lower_tf else None
                     future = executor.submit(
                         _load_symbol_timeframe,
@@ -513,14 +615,56 @@ def _load_panels_for_symbols(
                     futures[future] = symbol
                 for idx, future in enumerate(as_completed(futures), start=1):
                     symbol = futures[future]
-                    frame = future.result()
+                    try:
+                        frame = future.result()
+                    except Exception:
+                        if logger is not None:
+                            logger.exception(
+                                "subnet=%s timeframe=%s symbol=%s state=failed index=%d/%d",
+                                subnet_name,
+                                timeframe,
+                                symbol,
+                                idx,
+                                len(symbols),
+                            )
+                        raise
                     if frame is None:
+                        if logger is not None:
+                            logger.warning(
+                                "subnet=%s timeframe=%s symbol=%s state=missing index=%d/%d",
+                                subnet_name,
+                                timeframe,
+                                symbol,
+                                idx,
+                                len(symbols),
+                            )
                         if strict:
                             raise FileNotFoundError(f"Missing {timeframe} data for {symbol}")
                         continue
                     symbol_cache[symbol][timeframe] = frame
                     per_symbol[symbol] = frame
-                    if logger is not None and (idx == len(symbols) or idx % 5 == 0):
+                    if logger is not None:
+                        logger.info(
+                            "subnet=%s timeframe=%s symbol=%s state=done index=%d/%d rows=%d start=%s end=%s",
+                            subnet_name,
+                            timeframe,
+                            symbol,
+                            idx,
+                            len(symbols),
+                            len(frame),
+                            frame.index[0] if len(frame) else None,
+                            frame.index[-1] if len(frame) else None,
+                        )
+                        if memory_guard_min_available_mb > 0.0 or memory_guard_critical_available_mb > 0.0:
+                            enforce_memory_guard(
+                                logger,
+                                status_file,
+                                "load_panels",
+                                min_available_mb=memory_guard_min_available_mb,
+                                critical_available_mb=memory_guard_critical_available_mb,
+                                details={"subnet": subnet_name, "timeframe": timeframe, "symbol": symbol, "index": idx, "workers": worker_count},
+                            )
+                    if logger is not None:
                         log_progress(logger, status_file, "load_panels", idx, len(symbols), subnet=subnet_name, timeframe=timeframe, valid_symbols=len(per_symbol), workers=worker_count)
         panels[timeframe] = _align_frames(per_symbol, expected_symbols=symbols)
         if logger is not None:
@@ -544,6 +688,8 @@ def load_staged_panels(
     logger=None,
     status_file: str | None = None,
     max_workers: int = 0,
+    memory_guard_min_available_mb: float = 0.0,
+    memory_guard_critical_available_mb: float = 0.0,
 ) -> tuple[StagedPanels, StagedPanels]:
     candle_path = Path(candle_root)
     tick_path = Path(tick_root) if tick_root else None
@@ -568,6 +714,8 @@ def load_staged_panels(
         relevant_quarters=relevant_quarters,
         tick_file_map=tick_file_map,
         max_workers=max_workers,
+        memory_guard_min_available_mb=memory_guard_min_available_mb,
+        memory_guard_critical_available_mb=memory_guard_critical_available_mb,
     )
     fx_panels = _load_panels_for_symbols(
         candle_path,
@@ -583,6 +731,8 @@ def load_staged_panels(
         relevant_quarters=relevant_quarters,
         tick_file_map=tick_file_map,
         max_workers=max_workers,
+        memory_guard_min_available_mb=memory_guard_min_available_mb,
+        memory_guard_critical_available_mb=memory_guard_critical_available_mb,
     )
     anchor_source = fx_panels[anchor_timeframe] if fx_panels.get(anchor_timeframe) else btc_panels[anchor_timeframe]
     if not anchor_source:
@@ -604,7 +754,7 @@ def load_staged_panels(
                 lookup[timeframe] = _build_anchor_lookup(anchor_timestamps, tf_index)
             else:
                 lookup[timeframe] = np.zeros(len(anchor_timestamps), dtype=np.int32)
-        tpo_panels = _presweep_tpo(panels, symbols, requested_timeframes, logger=logger)
+        tpo_panels = _presweep_tpo(panels, symbols, requested_timeframes, logger=logger, max_workers=max_workers)
         return StagedPanels(
             subnet_name=subnet_name,
             symbols=symbols,
