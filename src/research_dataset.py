@@ -62,10 +62,12 @@ class CanonicalResearchDataset:
 
 
 def _read_candles_csv(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, header=None, names=_CSV_COLS)
-    parsed = pd.to_datetime(df["bar_time"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
-    if parsed.notna().sum() < max(3, len(df) // 4):
-        df = pd.read_csv(csv_path)
+    with csv_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        first_line = handle.readline().strip().lower()
+
+    has_named_header = first_line.startswith("bar_time,") or first_line.startswith("<bar_time>,")
+    if has_named_header:
+        df = pd.read_csv(csv_path, low_memory=False)
         df.columns = [str(c).strip("<>").lower() for c in df.columns]
         rename_map = {
             "bar_time": "dt",
@@ -81,8 +83,27 @@ def _read_candles_csv(csv_path: Path) -> pd.DataFrame:
         }
         df = df.rename(columns=rename_map)
     else:
-        df = df.rename(columns=_RENAME)
-        df["dt"] = parsed
+        df = pd.read_csv(csv_path, header=None, names=_CSV_COLS, low_memory=False)
+        parsed = pd.to_datetime(df["bar_time"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
+        if parsed.notna().sum() < max(3, len(df) // 4):
+            df = pd.read_csv(csv_path, low_memory=False)
+            df.columns = [str(c).strip("<>").lower() for c in df.columns]
+            rename_map = {
+                "bar_time": "dt",
+                "datetime": "dt",
+                "time": "dt",
+                "open": "o",
+                "high": "h",
+                "low": "l",
+                "close": "c",
+                "tick_volume": "tk",
+                "volume": "tk",
+                "spread": "sp",
+            }
+            df = df.rename(columns=rename_map)
+        else:
+            df = df.rename(columns=_RENAME)
+            df["dt"] = parsed
 
     if "dt" not in df.columns:
         raise ValueError(f"Could not locate datetime column in {csv_path}")
