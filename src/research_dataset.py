@@ -8,6 +8,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 
 from dataextractor_contract import resolve_candle_path
 from feature_engine import compute_atr
@@ -108,7 +109,7 @@ def _read_candles_csv(csv_path: Path) -> pd.DataFrame:
     if "dt" not in df.columns:
         raise ValueError(f"Could not locate datetime column in {csv_path}")
 
-    if not np.issubdtype(df["dt"].dtype, np.datetime64):
+    if not is_datetime64_any_dtype(df["dt"]):
         df["dt"] = pd.to_datetime(df["dt"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
     df = df.dropna(subset=["dt"])
     for col in ("o", "h", "l", "c", "sp", "tk"):
