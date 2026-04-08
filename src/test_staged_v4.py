@@ -243,7 +243,7 @@ def test_pushgateway_metrics_render_training_progress() -> None:
         "details": {"epoch": 1},
     }
     rendered = runtime_logging_module._render_pushgateway_metrics(
-        r"D:\work\Algo-C2-Codex\data\remote_runs\demo_run\status.json",
+        "/workspace/Algo-C2-Codex/data/remote_runs/demo_run/status.json",
         payload,
     ).decode("utf-8")
     assert 'algoc2_training_status{run="demo_run",stage="stage2_fx",state="running",host="thinley"} 1.0' in rendered
@@ -267,7 +267,7 @@ def test_pushgateway_metrics_render_training_throughput() -> None:
         },
     }
     rendered = runtime_logging_module._render_pushgateway_metrics(
-        r"D:\work\Algo-C2-Codex\data\remote_runs\demo_run\status.json",
+        "/workspace/Algo-C2-Codex/data/remote_runs/demo_run/status.json",
         payload,
     ).decode("utf-8")
     assert 'algoc2_training_stage_batches{run="demo_run",stage="stage2_fx",host="thinley"} 128.0' in rendered
