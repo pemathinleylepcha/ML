@@ -253,7 +253,6 @@ def build_fx_timeframe_batch(
 
     requested_workers = max_workers if max_workers and max_workers > 0 else min(16, max(4, (os.cpu_count() or 8) // 2))
     worker_count = max(1, min(total_symbols, requested_workers))
-    future_specs = []
     if shard_dir is not None:
         shard_dir.mkdir(parents=True, exist_ok=True)
     if symbol_timeout_sec is not None:
@@ -262,13 +261,14 @@ def build_fx_timeframe_batch(
         symbol_timeout = _DEFAULT_SYMBOL_TIMEOUT_SEC
     else:
         symbol_timeout = None
-    default_batch_deadline = _DEFAULT_BATCH_DEADLINE_SEC if timeframe == "tick" else max(1800.0, _DEFAULT_BATCH_DEADLINE_SEC)
+    default_batch_deadline = _DEFAULT_BATCH_DEADLINE_SEC if timeframe == "tick" else max(14400.0, _DEFAULT_BATCH_DEADLINE_SEC)
     batch_deadline = time.perf_counter() + float(
         batch_deadline_sec if batch_deadline_sec is not None else default_batch_deadline
     )
     failed_symbols: list[str] = []
     executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=f"fx_{timeframe}")
     try:
+        queued_specs = []
         for node_idx, symbol in enumerate(panels.symbols, start=1):
             col_idx = node_idx - 1
             shard_path = _symbol_shard_path(shard_dir, symbol) if shard_dir is not None else None
@@ -310,6 +310,20 @@ def build_fx_timeframe_batch(
             should_build_tpo = valid_mask[:, col_idx].any() and (tradable_mask[col_idx] or include_signal_only_tpo)
             tpo_source_frame = tpo_source_frames.get(symbol) if should_build_tpo and tpo_source_lookup is not None else None
             label_source_frame = coarse_tick_frames.get(symbol) if timeframe == "tick" and tradable_mask[col_idx] and tick_to_m1_lookup is not None else None
+            queued_specs.append(
+                (
+                    node_idx,
+                    col_idx,
+                    symbol,
+                    shard_path,
+                    tpo_source_frame,
+                    label_source_frame,
+                )
+            )
+        pending = {}
+
+        def _submit_spec(spec: tuple[int, int, str, Path | None, pd.DataFrame | None, pd.DataFrame | None]) -> None:
+            node_idx, col_idx, symbol, shard_path, tpo_source_frame, label_source_frame = spec
             if logger is not None:
                 logger.info("stage=build_fx_feature_symbol state=start timeframe=%s symbol=%s", timeframe, symbol)
             future = executor.submit(
@@ -328,13 +342,10 @@ def build_fx_timeframe_batch(
                 label_source_frame,
                 tick_to_m1_lookup,
             )
-            future_specs.append((node_idx, col_idx, symbol, shard_path, time.perf_counter(), future))
+            pending[future] = (node_idx, col_idx, symbol, shard_path, time.perf_counter())
 
-        future_to_spec = {
-            future: (node_idx, col_idx, symbol, shard_path, submitted_at)
-            for node_idx, col_idx, symbol, shard_path, submitted_at, future in future_specs
-        }
-        pending = dict(future_to_spec)
+        while queued_specs and len(pending) < worker_count:
+            _submit_spec(queued_specs.pop(0))
 
         def _mark_failed_symbol(
             node_idx: int,
@@ -389,6 +400,9 @@ def build_fx_timeframe_batch(
                     future.cancel()
                     pending.pop(future, None)
                     _mark_failed_symbol(node_idx, col_idx, symbol, shard_path, submitted_at, "batch_deadline")
+                while queued_specs:
+                    node_idx, col_idx, symbol, shard_path, _, _ = queued_specs.pop(0)
+                    _mark_failed_symbol(node_idx, col_idx, symbol, shard_path, now, "batch_deadline")
                 break
 
             for future, spec in list(pending.items()):
@@ -497,6 +511,8 @@ def build_fx_timeframe_batch(
                         timeframe=timeframe,
                         workers=worker_count,
                     )
+                if queued_specs:
+                    _submit_spec(queued_specs.pop(0))
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 

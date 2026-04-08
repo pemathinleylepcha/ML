@@ -693,6 +693,7 @@ def load_staged_panels(
     max_workers: int = 0,
     memory_guard_min_available_mb: float = 0.0,
     memory_guard_critical_available_mb: float = 0.0,
+    enable_tpo_presweep: bool = True,
 ) -> tuple[StagedPanels, StagedPanels]:
     candle_path = Path(candle_root)
     tick_path = Path(tick_root) if tick_root else None
@@ -757,7 +758,13 @@ def load_staged_panels(
                 lookup[timeframe] = _build_anchor_lookup(anchor_timestamps, tf_index)
             else:
                 lookup[timeframe] = np.zeros(len(anchor_timestamps), dtype=np.int32)
-        tpo_panels = _presweep_tpo(panels, symbols, requested_timeframes, logger=logger, max_workers=max_workers)
+        tpo_panels = (
+            _presweep_tpo(panels, symbols, requested_timeframes, logger=logger, max_workers=max_workers)
+            if enable_tpo_presweep
+            else {}
+        )
+        if logger is not None and not enable_tpo_presweep:
+            logger.info("state=tpo_presweep source_tf=skip reason=disabled_for_callsite subnet=%s", subnet_name)
         return StagedPanels(
             subnet_name=subnet_name,
             symbols=symbols,

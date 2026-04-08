@@ -9,6 +9,7 @@ import shutil
 import numpy as np
 
 from staged_v4.config import FX_TRADABLE_NAMES
+from staged_v4.config import TPO_SOURCE_TIMEFRAME
 from staged_v4.contracts import BTCFeatureBatch, FXFeatureBatch, TimeframeFeatureBatch
 from staged_v4.data.bridge_features import build_bridge_batches
 from staged_v4.data.btc_features import build_btc_feature_batch, build_btc_timeframe_batch
@@ -263,6 +264,7 @@ def prepare_staged_cache(
                 logger=logger,
                 status_file=status_file,
                 max_workers=max_workers,
+                enable_tpo_presweep=False,
             )
     selected_timeframes = tuple(timeframes or fx_panels.panels.keys())
     root = Path(output_root)
@@ -276,6 +278,27 @@ def prepare_staged_cache(
     fx_bridge_meta: dict[str, dict[str, object]] = {}
     built_btc_timeframes: list[str] = []
     built_fx_timeframes: list[str] = []
+    tpo_source_uses: dict[str, int] = {}
+    for timeframe in selected_timeframes:
+        source_tf = TPO_SOURCE_TIMEFRAME[timeframe]
+        tpo_source_uses[source_tf] = tpo_source_uses.get(source_tf, 0) + 1
+
+    def _evict_timeframe_buffers(timeframe: str) -> None:
+        btc_panels.panels.pop(timeframe, None)
+        fx_panels.panels.pop(timeframe, None)
+        source_tf = TPO_SOURCE_TIMEFRAME[timeframe]
+        remaining = tpo_source_uses.get(source_tf, 0) - 1
+        tpo_source_uses[source_tf] = remaining
+        if remaining <= 0:
+            btc_panels.tpo_panels.pop(source_tf, None)
+            fx_panels.tpo_panels.pop(source_tf, None)
+        logger.info(
+            "stage=flush_processed_data timeframe=%s source_tf=%s remaining_source_uses=%d",
+            timeframe,
+            source_tf,
+            max(remaining, 0),
+        )
+        gc.collect()
 
     for timeframe in selected_timeframes:
         btc_tf_path = btc_root / f"{timeframe}.npz"
@@ -309,7 +332,7 @@ def prepare_staged_cache(
                     max_workers=max_workers,
                     logger=logger,
                     status_file=status_file,
-                    shard_root=shard_root if timeframe == "tick" else None,
+                    shard_root=shard_root,
                 )
             _serialize_timeframe_batch(fx_tf_batch, fx_tf_path)
             if shard_root.exists():
@@ -325,6 +348,7 @@ def prepare_staged_cache(
             "fx_timestamps": fx_ts.astype("datetime64[ns]").astype(str).tolist(),
         }
         del fx_tf_batch, btc_idx, fx_ts
+        _evict_timeframe_buffers(timeframe)
         gc.collect()
 
     with stage_context(logger, status_file, "write_streaming_cache_metadata", output_root=str(output_root)):

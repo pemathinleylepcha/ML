@@ -177,11 +177,15 @@ def append_status_event(status_file: str | None, payload: dict[str, Any]) -> Non
     event_path = _status_event_path(status_file)
     if event_path is None:
         return
-    event_path.parent.mkdir(parents=True, exist_ok=True)
-    event_payload = {"runtime": runtime_snapshot(), **payload}
-    with event_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event_payload, default=str))
-        handle.write("\n")
+    try:
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        event_payload = {"runtime": runtime_snapshot(), **payload}
+        with event_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event_payload, default=str))
+            handle.write("\n")
+    except OSError:
+        # Status-event sidecar writes are best-effort and must never kill a run.
+        return
 
 
 def _redis_settings() -> dict[str, Any] | None:
