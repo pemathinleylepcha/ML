@@ -9,3 +9,7 @@ __pycache__/
 !src/staged_v4/data/**
 !src/staged_v4/models/
 !src/staged_v4/models/**
+DOC/*.md
+DOC/**/*.md
+DOC/IDEA-GRPO/
+/README.md
