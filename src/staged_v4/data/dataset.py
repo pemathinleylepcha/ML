@@ -267,7 +267,8 @@ def _load_symbol_timeframe(
             frame["real"] = True
             chunks.append(frame)
         if chunks:
-            df = pd.concat(chunks).sort_index().drop_duplicates()
+            df = pd.concat(chunks).sort_index()
+            df = df[~df.index.duplicated(keep="last")]
         elif lower_timeframe == "tick" and tick_root is not None:
             tick_path = _find_tick_file(tick_root, symbol, tick_file_map=tick_file_map)
             if tick_path is not None:
@@ -337,6 +338,8 @@ def _align_frames(frames: dict[str, pd.DataFrame], expected_symbols: tuple[str, 
             out["real"] = False
             aligned[symbol] = out
             continue
+        if frame.index.has_duplicates:
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         out = frame.reindex(union_index)
         real_mask = out["c"].notna()
         out["sp"] = out["sp"].fillna(0.0)
