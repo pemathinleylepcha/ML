@@ -163,7 +163,10 @@ def _gpu_memory_state(
             "min_available_mb": float(min_available_mb),
             "critical_available_mb": float(critical_available_mb),
         }
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    cuda_device = device
+    if device.index is None:
+        cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
     free_mb = free_bytes / (1024 ** 2)
     state = "ok"
     if free_mb < critical_available_mb:
@@ -174,8 +177,8 @@ def _gpu_memory_state(
         "state": state,
         "vram_free_mb": float(free_mb),
         "vram_total_mb": float(total_bytes / (1024 ** 2)),
-        "vram_allocated_mb": float(torch.cuda.memory_allocated(device) / (1024 ** 2)),
-        "vram_reserved_mb": float(torch.cuda.memory_reserved(device) / (1024 ** 2)),
+        "vram_allocated_mb": float(torch.cuda.memory_allocated(cuda_device) / (1024 ** 2)),
+        "vram_reserved_mb": float(torch.cuda.memory_reserved(cuda_device) / (1024 ** 2)),
         "min_available_mb": float(min_available_mb),
         "critical_available_mb": float(critical_available_mb),
     }

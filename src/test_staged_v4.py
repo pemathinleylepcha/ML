@@ -202,6 +202,28 @@ def test_gpu_memory_state_is_safe_on_cpu() -> None:
     assert guard["vram_total_mb"] is None
 
 
+def test_gpu_memory_state_resolves_default_cuda_device_index() -> None:
+    free_bytes = 8 * 1024 ** 3
+    total_bytes = 24 * 1024 ** 3
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch("torch.cuda.mem_get_info", return_value=(free_bytes, total_bytes)) as mem_get_info,
+        patch("torch.cuda.memory_allocated", return_value=512 * 1024 ** 2) as memory_allocated,
+        patch("torch.cuda.memory_reserved", return_value=1024 * 1024 ** 2) as memory_reserved,
+    ):
+        guard = _gpu_memory_state(
+            torch.device("cuda"),
+            min_available_mb=4096.0,
+            critical_available_mb=2048.0,
+        )
+    mem_get_info.assert_called_once_with(torch.device("cuda:0"))
+    memory_allocated.assert_called_once_with(torch.device("cuda:0"))
+    memory_reserved.assert_called_once_with(torch.device("cuda:0"))
+    assert guard["state"] == "ok"
+    assert guard["vram_free_mb"] == free_bytes / (1024 ** 2)
+    assert guard["vram_total_mb"] == total_bytes / (1024 ** 2)
+
+
 def test_memory_guard_raises_when_available_memory_is_critical() -> None:
     logger = logging.getLogger("memory_guard_test")
     with patch.object(runtime_logging_module, "runtime_snapshot", return_value={"system_mem_available_mb": 1024.0}):
