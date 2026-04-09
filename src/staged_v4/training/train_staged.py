@@ -53,6 +53,13 @@ from staged_v4.utils.runtime_logging import (
 )
 
 
+_DEFAULT_TRAINING_CFG = TrainingConfig()
+_DEFAULT_LEARNING_RATE = float(_DEFAULT_TRAINING_CFG.learning_rate)
+_DEFAULT_FINE_TUNE_LEARNING_RATE = float(_DEFAULT_TRAINING_CFG.fine_tune_learning_rate)
+_DEFAULT_MEMORY_GUARD_CHECK_INTERVAL = int(_DEFAULT_TRAINING_CFG.memory_guard_check_interval)
+_CUDA_MEMORY_GUARD_CHECK_INTERVAL = 50
+
+
 def _default_split(n_items: int, purge_bars: int) -> list[dict[str, object]]:
     split = max(int(n_items * 0.7), 1)
     train_idx = np.arange(max(0, split - purge_bars), dtype=np.int32)
@@ -267,6 +274,86 @@ def _maybe_compile_cuda_forward(module: nn.Module, logger: logging.Logger, label
         logger.info("state=torch_compile_enabled target=%s mode=reduce-overhead", label)
     except Exception as exc:
         logger.warning("state=torch_compile_disabled target=%s reason=%s", label, exc)
+
+
+def _effective_memory_guard_interval(device: torch.device, training_cfg: TrainingConfig) -> int:
+    interval = max(1, int(training_cfg.memory_guard_check_interval))
+    if device.type == "cuda" and interval == _DEFAULT_MEMORY_GUARD_CHECK_INTERVAL:
+        return max(interval, _CUDA_MEMORY_GUARD_CHECK_INTERVAL)
+    return interval
+
+
+def _learning_rate_scale_for_logging(value: float, baseline: float) -> float:
+    if baseline <= 0.0:
+        return 1.0
+    return float(value / baseline)
+
+
+def _configure_cuda_backend(logger: logging.Logger, device: torch.device, training_cfg: TrainingConfig) -> None:
+    if device.type != "cuda":
+        return
+    benchmark_enabled = not training_cfg.use_torch_compile
+    torch.backends.cudnn.benchmark = benchmark_enabled
+    logger.info(
+        "state=cuda_backend cudnn_benchmark=%s use_torch_compile=%s",
+        benchmark_enabled,
+        training_cfg.use_torch_compile,
+    )
+
+
+def _log_effective_training_runtime(
+    logger: logging.Logger,
+    status_file: str | None,
+    device: torch.device,
+    training_cfg: TrainingConfig,
+    *,
+    fold: int,
+    fold_total: int,
+) -> int:
+    guard_interval = _effective_memory_guard_interval(device, training_cfg)
+    lr_scale = _learning_rate_scale_for_logging(training_cfg.learning_rate, _DEFAULT_LEARNING_RATE)
+    fine_tune_lr_scale = _learning_rate_scale_for_logging(
+        training_cfg.fine_tune_learning_rate,
+        _DEFAULT_FINE_TUNE_LEARNING_RATE,
+    )
+    cudnn_benchmark = bool(device.type == "cuda" and torch.backends.cudnn.benchmark)
+    logger.info(
+        "state=effective_batch_size batch_size=%d lr_scale=%.2f fine_tune_lr_scale=%.2f",
+        training_cfg.batch_size,
+        lr_scale,
+        fine_tune_lr_scale,
+    )
+    logger.info(
+        "fold=%d/%d state=runtime_config memory_guard_check_interval=%d effective_memory_guard_check_interval=%d use_torch_compile=%s cudnn_benchmark=%s",
+        fold + 1,
+        fold_total,
+        training_cfg.memory_guard_check_interval,
+        guard_interval,
+        training_cfg.use_torch_compile,
+        cudnn_benchmark,
+    )
+    write_status(
+        status_file,
+        {
+            "state": "running",
+            "stage": "runtime_config",
+            "fold": fold,
+            "fold_total": fold_total,
+            "details": {
+                "batch_size": int(training_cfg.batch_size),
+                "learning_rate": float(training_cfg.learning_rate),
+                "learning_rate_scale": lr_scale,
+                "fine_tune_learning_rate": float(training_cfg.fine_tune_learning_rate),
+                "fine_tune_learning_rate_scale": fine_tune_lr_scale,
+                "memory_guard_check_interval": int(training_cfg.memory_guard_check_interval),
+                "effective_memory_guard_check_interval": int(guard_interval),
+                "use_torch_compile": bool(training_cfg.use_torch_compile),
+                "cudnn_benchmark": cudnn_benchmark,
+                "device": device.type,
+            },
+        },
+    )
+    return guard_interval
 
 
 def _slice_window(arr: np.ndarray, end_idx: int, seq_len: int) -> np.ndarray:
@@ -629,6 +716,7 @@ def run_staged_experiment(
     if resolved_device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available on this host")
     device = torch.device(resolved_device)
+    _configure_cuda_backend(logger, device, training_cfg)
     logger.info("state=device_selected device=%s cuda_available=%s", device.type, torch.cuda.is_available())
 
     feature_mode = "prebuilt"
@@ -820,7 +908,14 @@ def run_staged_experiment(
         btc_active = 0
         fx_active = 0
         batch_counter = 0
-        guard_interval = max(1, training_cfg.memory_guard_check_interval)
+        guard_interval = _log_effective_training_runtime(
+            logger,
+            status_file,
+            device,
+            training_cfg,
+            fold=fold_index,
+            fold_total=len(splits),
+        )
 
         for _epoch in range(training_cfg.epochs_stage1):
             btc_subnet.train()

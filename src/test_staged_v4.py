@@ -38,7 +38,9 @@ from staged_v4.training.train_staged import (
     _build_edge_tensors,
     _build_subnet_sequence_batch,
     _compute_subnet_loss,
+    _effective_memory_guard_interval,
     _gpu_memory_state,
+    _learning_rate_scale_for_logging,
     _resolve_cached_splits,
     run_staged_experiment,
 )
@@ -200,6 +202,22 @@ def test_gpu_memory_state_is_safe_on_cpu() -> None:
     assert guard["state"] == "ok"
     assert guard["vram_free_mb"] is None
     assert guard["vram_total_mb"] is None
+
+
+def test_effective_memory_guard_interval_uses_cuda_default() -> None:
+    cfg = TrainingConfig(anchor_timeframe="M1")
+    assert _effective_memory_guard_interval(torch.device("cuda"), cfg) == 50
+    assert _effective_memory_guard_interval(torch.device("cpu"), cfg) == 25
+
+
+def test_effective_memory_guard_interval_respects_override() -> None:
+    cfg = TrainingConfig(anchor_timeframe="M1", memory_guard_check_interval=12)
+    assert _effective_memory_guard_interval(torch.device("cuda"), cfg) == 12
+
+
+def test_learning_rate_scale_for_logging_uses_default_baseline() -> None:
+    assert _learning_rate_scale_for_logging(2e-3, 1e-3) == 2.0
+    assert _learning_rate_scale_for_logging(3e-4, 3e-4) == 1.0
 
 
 def test_gpu_memory_state_resolves_default_cuda_device_index() -> None:
@@ -1018,6 +1036,10 @@ def main() -> None:
         test_rolling_correlation_adjacency_ignores_constant_columns_without_warning,
         test_memory_guard_reduces_workers_when_available_memory_is_low,
         test_gpu_memory_state_is_safe_on_cpu,
+        test_effective_memory_guard_interval_uses_cuda_default,
+        test_effective_memory_guard_interval_respects_override,
+        test_learning_rate_scale_for_logging_uses_default_baseline,
+        test_gpu_memory_state_resolves_default_cuda_device_index,
         test_memory_guard_raises_when_available_memory_is_critical,
         test_jit_to_device_preserves_values_on_cpu,
         test_pushgateway_metrics_render_training_progress,
