@@ -228,10 +228,12 @@ def prepare_staged_cache(
     min_train_blocks: int = 2,
     purge_bars: int = 6,
     max_workers: int = 0,
+    panel_load_workers: int = 0,
     logger: logging.Logger | None = None,
     status_file: str | None = None,
 ) -> dict:
     logger = logger or logging.getLogger("prepare_staged_cache")
+    effective_panel_load_workers = panel_load_workers if panel_load_workers and panel_load_workers > 0 else max_workers
     if mode == "synthetic":
         with stage_context(logger, status_file, "generate_synthetic_panels", n_anchor=synthetic_n_anchor, anchor_timeframe=anchor_timeframe):
             btc_panels, fx_panels = generate_synthetic_panels(n_anchor=synthetic_n_anchor, anchor_timeframe=anchor_timeframe)
@@ -248,6 +250,7 @@ def prepare_staged_cache(
             end=end,
             timeframes=timeframes,
             max_workers=max_workers,
+            panel_load_workers=effective_panel_load_workers,
         ):
             btc_panels, fx_panels = load_staged_panels(
                 candle_root=candle_root,
@@ -263,7 +266,7 @@ def prepare_staged_cache(
                 purge_bars=purge_bars,
                 logger=logger,
                 status_file=status_file,
-                max_workers=max_workers,
+                max_workers=effective_panel_load_workers,
                 enable_tpo_presweep=False,
             )
     selected_timeframes = tuple(timeframes or fx_panels.panels.keys())
@@ -274,6 +277,15 @@ def prepare_staged_cache(
     btc_root.mkdir(parents=True, exist_ok=True)
     fx_root.mkdir(parents=True, exist_ok=True)
     bridge_root.mkdir(parents=True, exist_ok=True)
+
+    gc.collect()
+    from staged_v4.utils.runtime_logging import enforce_memory_guard
+    enforce_memory_guard(logger, status_file, "pre_build_loop", raise_on_critical=False)
+    _panel_summary: dict[str, dict[str, int]] = {}
+    for _tf, _frames in fx_panels.panels.items():
+        _rows = next(iter(_frames.values())).shape[0] if _frames else 0
+        _panel_summary[_tf] = {"symbols": len(_frames), "rows": _rows}
+    logger.info("stage=pre_build_loop panels=%s selected_timeframes=%s", json.dumps(_panel_summary), ",".join(selected_timeframes))
 
     fx_bridge_meta: dict[str, dict[str, object]] = {}
     built_btc_timeframes: list[str] = []
@@ -314,6 +326,8 @@ def prepare_staged_cache(
 
         fx_tf_path = fx_root / f"{timeframe}.npz"
         shard_root = fx_root / "_shards" / timeframe
+        gc.collect()
+        enforce_memory_guard(logger, status_file, f"pre_fx_build_{timeframe}", raise_on_critical=False)
         if fx_tf_path.exists():
             logger.info("stage=build_fx_feature_timeframe state=skip timeframe=%s path=%s", timeframe, fx_tf_path.name)
             fx_tf_batch = _deserialize_timeframe_batch(timeframe, fx_panels.symbols, fx_tf_path)
@@ -394,6 +408,7 @@ def prepare_staged_cache(
             "min_train_blocks": min_train_blocks,
             "purge_bars": purge_bars,
             "max_workers": max_workers,
+            "panel_load_workers": effective_panel_load_workers,
         }
     )
     (Path(output_root) / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

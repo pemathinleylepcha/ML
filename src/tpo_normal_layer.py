@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from staged_v4.config import ATR_MIN_THRESHOLD, ATR_NORM_CLIP
+
 
 EPS = 1e-8
 
@@ -20,6 +22,7 @@ class TPOProfile:
     value_area_width_atr: float
     lookback: int = 0
     weight: float = 1.0
+    degenerate: bool = False
 
 
 @dataclass(slots=True)
@@ -31,6 +34,7 @@ class TPOMemoryState:
     rejection_score: float
     poc_drift_atr: float
     value_area_overlap: float
+    degenerate: bool = False
 
 
 @dataclass(slots=True)
@@ -46,6 +50,40 @@ class TPONormalDecision:
     memory: TPOMemoryState
     legacy_direction: int
     legacy_confidence: float
+
+
+def is_degenerate_atr(atr_price: float) -> bool:
+    return not np.isfinite(float(atr_price)) or float(atr_price) <= ATR_MIN_THRESHOLD
+
+
+def _zero_tpo_profile(last_price: float, *, lookback: int = 0, weight: float = 1.0, degenerate: bool = False) -> TPOProfile:
+    return TPOProfile(
+        poc=last_price,
+        value_area_low=last_price,
+        value_area_high=last_price,
+        profile_low=last_price,
+        profile_high=last_price,
+        balance_score=0.0,
+        distance_to_poc_atr=0.0,
+        value_area_width_atr=0.0,
+        lookback=lookback,
+        weight=weight,
+        degenerate=degenerate,
+    )
+
+
+def _zero_tpo_memory_state(last_price: float, *, lookback: int = 0, degenerate: bool = False) -> TPOMemoryState:
+    profile = _zero_tpo_profile(last_price, lookback=lookback, degenerate=degenerate)
+    return TPOMemoryState(
+        composite_profile=profile,
+        profiles=(profile,),
+        support_score=0.0,
+        resistance_score=0.0,
+        rejection_score=0.0,
+        poc_drift_atr=0.0,
+        value_area_overlap=0.0,
+        degenerate=degenerate,
+    )
 
 
 def _build_tpo_counts(
@@ -124,11 +162,15 @@ def compute_tpo_profile(
     tail_high = high[-lookback:].astype(np.float64, copy=False)
     tail_low = low[-lookback:].astype(np.float64, copy=False)
     tail_close = close[-lookback:].astype(np.float64, copy=False)
+    effective_lookback = int(min(lookback, len(close)))
+    last_price = float(tail_close[-1])
+
+    if is_degenerate_atr(atr_price):
+        return _zero_tpo_profile(last_price, lookback=effective_lookback, degenerate=True)
 
     profile_low = float(np.min(tail_low))
     profile_high = float(np.max(tail_high))
     if profile_high - profile_low < EPS:
-        last_price = float(tail_close[-1])
         return TPOProfile(
             poc=last_price,
             value_area_low=last_price,
@@ -138,13 +180,13 @@ def compute_tpo_profile(
             balance_score=1.0,
             distance_to_poc_atr=0.0,
             value_area_width_atr=0.0,
+            lookback=effective_lookback,
         )
 
     counts, edges = _build_tpo_counts(tail_high, tail_low, profile_low, profile_high, n_bins=n_bins)
     poc, value_area_low, value_area_high = _value_area_bounds(counts, edges, value_area_fraction=value_area_fraction)
-    last_price = float(tail_close[-1])
     balance_score = float(np.max(counts) / max(np.sum(counts), 1.0))
-    atr_ref = max(float(atr_price), EPS)
+    atr_ref = float(atr_price)
 
     return TPOProfile(
         poc=float(poc),
@@ -153,9 +195,9 @@ def compute_tpo_profile(
         profile_low=float(profile_low),
         profile_high=float(profile_high),
         balance_score=balance_score,
-        distance_to_poc_atr=float((last_price - poc) / atr_ref),
-        value_area_width_atr=float((value_area_high - value_area_low) / atr_ref),
-        lookback=int(min(lookback, len(close))),
+        distance_to_poc_atr=float(np.clip((last_price - poc) / atr_ref, -ATR_NORM_CLIP, ATR_NORM_CLIP)),
+        value_area_width_atr=float(np.clip((value_area_high - value_area_low) / atr_ref, 0.0, ATR_NORM_CLIP)),
+        lookback=effective_lookback,
         weight=1.0,
     )
 
@@ -184,6 +226,8 @@ def compute_tpo_memory_state(
 ) -> TPOMemoryState:
     if len(close) == 0:
         raise ValueError("TPO memory state requires at least one close value")
+    if is_degenerate_atr(atr_price):
+        return _zero_tpo_memory_state(float(close[-1]), lookback=min(max(lookbacks, default=0), len(close)), degenerate=True)
 
     profiles: list[TPOProfile] = []
     raw_weights: list[float] = []
@@ -237,6 +281,7 @@ def compute_tpo_memory_state(
             value_area_width_atr=profile.value_area_width_atr,
             lookback=profile.lookback,
             weight=float(weight),
+            degenerate=profile.degenerate,
         )
         for profile, weight in zip(profiles, weights)
     )
@@ -267,10 +312,10 @@ def compute_tpo_memory_state(
     recent_close = close[-min(int(rejection_lookback), len(close)) :].astype(np.float64, copy=False)
     in_value = (recent_close >= composite.value_area_low) & (recent_close <= composite.value_area_high)
     rejection_score = float(1.0 - np.mean(in_value)) if len(recent_close) > 0 else 0.0
-    atr_ref = max(float(atr_price), EPS)
+    atr_ref = float(atr_price)
     poc_drift_atr = 0.0
     if len(weighted_profiles) >= 2:
-        poc_drift_atr = float((weighted_profiles[0].poc - weighted_profiles[-1].poc) / atr_ref)
+        poc_drift_atr = float(np.clip((weighted_profiles[0].poc - weighted_profiles[-1].poc) / atr_ref, -ATR_NORM_CLIP, ATR_NORM_CLIP))
     overlap_scores = []
     for left, right in zip(weighted_profiles[:-1], weighted_profiles[1:]):
         overlap_scores.append(_value_area_overlap(left, right))
@@ -305,6 +350,23 @@ def build_tpo_normal_decision(
     protector_atr_norm: float = 0.0017,
     protector_spread_to_atr: float = 0.22,
 ) -> TPONormalDecision:
+    if is_degenerate_atr(atr_price):
+        memory = _zero_tpo_memory_state(float(close[-1]), lookback=min(reversal_lookback, len(close)), degenerate=True)
+        profile = memory.composite_profile
+        fallback_distance = max(spread_price, ATR_MIN_THRESHOLD)
+        return TPONormalDecision(
+            direction=0,
+            confidence=0.0,
+            protector_blocked=False,
+            protector_reason="degenerate_atr",
+            tp_distance=fallback_distance,
+            sl_distance=fallback_distance,
+            lot_scale=0.0,
+            profile=profile,
+            memory=memory,
+            legacy_direction=int(legacy_direction),
+            legacy_confidence=float(legacy_confidence),
+        )
     if len(close) < max(reversal_lookback, 8):
         profile = compute_tpo_profile(high, low, close, atr_price=atr_price, lookback=len(close))
         memory = TPOMemoryState(
@@ -330,7 +392,7 @@ def build_tpo_normal_decision(
             legacy_confidence=float(legacy_confidence),
         )
 
-    atr_ref = max(float(atr_price), EPS)
+    atr_ref = float(atr_price)
     last_price = float(close[-1])
     last_ret = float(np.log(max(close[-1], EPS) / max(close[-2], EPS)))
     medium_ret = float(np.log(max(close[-1], EPS) / max(close[-4], EPS)))

@@ -49,6 +49,23 @@ from staged_v4.utils.graph_helpers import rolling_correlation_adjacency
 from staged_v4.utils import runtime_logging as runtime_logging_module
 
 
+def _make_tpo_test_ohlc(base_price: float, amplitude: float, half_range: float, n_bars: int = 256) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.linspace(0.0, 6.0 * np.pi, n_bars, dtype=np.float64)
+    trend = np.linspace(-0.35 * amplitude, 0.35 * amplitude, n_bars, dtype=np.float64)
+    close = base_price + amplitude * np.sin(x) + trend
+    high = close + half_range * (1.0 + 0.15 * np.sin(0.7 * x + 0.2))
+    low = close - half_range * (1.0 + 0.15 * np.cos(0.5 * x + 0.4))
+    return high.astype(np.float32), low.astype(np.float32), close.astype(np.float32)
+
+
+def _assert_tpo_feature_values_are_sane(features: np.ndarray, start_idx: int = 32) -> None:
+    active = features[start_idx:]
+    assert np.isfinite(active).all()
+    nonzero = active[np.abs(active) > 0.0]
+    assert nonzero.size > 0
+    assert float(np.max(np.abs(nonzero))) <= 100.0
+
+
 def test_synthetic_panels_cover_all_timeframes() -> None:
     btc_panels, fx_panels = generate_synthetic_panels(n_anchor=32, anchor_timeframe="M1")
     assert set(btc_panels.panels) == set(ALL_TIMEFRAMES)
@@ -112,6 +129,44 @@ def test_tpo_and_platt() -> None:
     probs = apply_platt_scaler(artifact, logits)
     assert probs.shape == (4,)
     assert np.all((probs > 0.0) & (probs < 1.0))
+
+
+def test_tpo_degenerate_atr_bars_zero_out_features() -> None:
+    close = np.full(128, 1.1000, dtype=np.float32)
+    high = close.copy()
+    low = close.copy()
+    features, _ = compute_tpo_feature_panel(high, low, close)
+    assert features.shape == (128, 8)
+    assert np.isfinite(features).all()
+    assert np.count_nonzero(features) == 0
+
+
+def test_tpo_eurusd_scale_features_remain_sane() -> None:
+    high, low, close = _make_tpo_test_ohlc(base_price=1.1000, amplitude=0.0009, half_range=0.00035)
+    features, _ = compute_tpo_feature_panel(high, low, close)
+    assert features.shape == (256, 8)
+    _assert_tpo_feature_values_are_sane(features)
+
+
+def test_tpo_us30_scale_features_remain_sane() -> None:
+    high, low, close = _make_tpo_test_ohlc(base_price=40000.0, amplitude=22.0, half_range=8.0)
+    features, _ = compute_tpo_feature_panel(high, low, close)
+    assert features.shape == (256, 8)
+    _assert_tpo_feature_values_are_sane(features)
+
+
+def test_tpo_mixed_stale_and_healthy_bars_zero_only_degenerate_segment() -> None:
+    flat_close = np.full(128, 0.6500, dtype=np.float32)
+    flat_high = flat_close.copy()
+    flat_low = flat_close.copy()
+    live_high, live_low, live_close = _make_tpo_test_ohlc(base_price=0.6510, amplitude=0.0007, half_range=0.00025, n_bars=128)
+    high = np.concatenate([flat_high, live_high]).astype(np.float32)
+    low = np.concatenate([flat_low, live_low]).astype(np.float32)
+    close = np.concatenate([flat_close, live_close]).astype(np.float32)
+    features, _ = compute_tpo_feature_panel(high, low, close)
+    assert np.isfinite(features).all()
+    assert np.count_nonzero(features[:128]) == 0
+    _assert_tpo_feature_values_are_sane(features[160:], start_idx=0)
 
 
 def test_jit_preswept_tpo_matches_fallback_sequences() -> None:
@@ -1032,6 +1087,10 @@ def main() -> None:
         test_stgnn_block_shapes,
         test_cooperative_rotation,
         test_tpo_and_platt,
+        test_tpo_degenerate_atr_bars_zero_out_features,
+        test_tpo_eurusd_scale_features_remain_sane,
+        test_tpo_us30_scale_features_remain_sane,
+        test_tpo_mixed_stale_and_healthy_bars_zero_only_degenerate_segment,
         test_compute_subnet_loss_applies_label_smoothing,
         test_rolling_correlation_adjacency_ignores_constant_columns_without_warning,
         test_memory_guard_reduces_workers_when_available_memory_is_low,

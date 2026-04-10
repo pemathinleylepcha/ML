@@ -240,6 +240,12 @@ def build_fx_timeframe_batch(
     shard_dir = Path(shard_root) if shard_root is not None else None
     completed = 0
     wait_cycles = 0
+    if logger is not None:
+        _batch_mb = (n_steps * n_nodes * (4 * 8 + 4 + 4 + 4 * 3 + 1 * 3)) / (1024 * 1024)
+        logger.info(
+            "stage=build_fx_timeframe_batch state=allocated timeframe=%s n_steps=%d n_nodes=%d batch_mb=%.1f tpo_source=%s",
+            timeframe, n_steps, n_nodes, _batch_mb, tpo_source_timeframe,
+        )
     for node_idx, symbol in enumerate(panels.symbols, start=1):
         frame = symbol_frames[symbol]
         col_idx = node_idx - 1
@@ -524,10 +530,14 @@ def build_fx_timeframe_batch(
             ",".join(failed_symbols[:16]),
         )
 
+    if logger is not None:
+        logger.info("stage=build_fx_timeframe_batch state=symbols_done timeframe=%s completed=%d failed=%d", timeframe, completed, len(failed_symbols))
     ret_1 = _lagged_logret_matrix(close, 1)
     ret_3 = _lagged_logret_matrix(close, 3)
     atr_norm = _atr_norm_matrix(high, low, close)
     range_norm = ((high - low) / np.maximum(np.abs(close), 1e-8)).astype(np.float32)
+    if logger is not None:
+        logger.info("stage=build_fx_timeframe_batch state=pre_laplacian timeframe=%s", timeframe)
     if timeframe == "tick" and coarse_tick_frames and tick_to_m1_lookup is not None:
         coarse_close = np.zeros((len(coarse_tick_index), n_nodes), dtype=np.float32)
         coarse_valid = np.zeros((len(coarse_tick_index), n_nodes), dtype=np.bool_)

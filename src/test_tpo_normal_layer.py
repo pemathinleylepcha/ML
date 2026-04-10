@@ -93,6 +93,35 @@ class TPONormalLayerTests(unittest.TestCase):
         self.assertGreaterEqual(memory.value_area_overlap, 0.0)
         self.assertLessEqual(memory.value_area_overlap, 1.0)
 
+    def test_memory_state_marks_zero_atr_as_degenerate(self) -> None:
+        close = np.linspace(1.1000, 1.1010, 64, dtype=np.float64)
+        high = close + 0.0004
+        low = close - 0.0004
+
+        memory = compute_tpo_memory_state(high=high, low=low, close=close, atr_price=0.0)
+
+        self.assertTrue(memory.degenerate)
+        self.assertTrue(memory.composite_profile.degenerate)
+        self.assertEqual(memory.composite_profile.distance_to_poc_atr, 0.0)
+        self.assertEqual(memory.composite_profile.value_area_width_atr, 0.0)
+        self.assertEqual(memory.support_score, 0.0)
+        self.assertEqual(memory.resistance_score, 0.0)
+        self.assertEqual(memory.rejection_score, 0.0)
+        self.assertEqual(memory.poc_drift_atr, 0.0)
+        self.assertEqual(memory.value_area_overlap, 0.0)
+
+    def test_memory_state_marks_tiny_atr_as_degenerate(self) -> None:
+        close = np.linspace(1.1000, 1.1010, 64, dtype=np.float64)
+        high = close + 0.0004
+        low = close - 0.0004
+
+        memory = compute_tpo_memory_state(high=high, low=low, close=close, atr_price=1e-10)
+
+        self.assertTrue(memory.degenerate)
+        self.assertTrue(memory.composite_profile.degenerate)
+        self.assertEqual(memory.composite_profile.distance_to_poc_atr, 0.0)
+        self.assertEqual(memory.composite_profile.value_area_width_atr, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

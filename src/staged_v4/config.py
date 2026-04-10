@@ -70,6 +70,8 @@ TPO_FEATURE_NAMES = (
     "tpo_poc_drift_atr",
     "tpo_value_area_overlap",
 )
+ATR_MIN_THRESHOLD = 1e-6
+ATR_NORM_CLIP = 50.0  # max abs value for ATR-normalized TPO features
 EDGE_TYPES = ("rolling_corr", "fundamental", "session")
 BTC_NODE_NAMES = tuple(SUBNET_24x7)
 FX_NODE_NAMES = tuple(SUBNET_24x5)

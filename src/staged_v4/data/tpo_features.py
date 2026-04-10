@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
-from staged_v4.config import TPO_FEATURE_NAMES
-from tpo_normal_layer import compute_tpo_memory_state
+from staged_v4.config import ATR_MIN_THRESHOLD, TPO_FEATURE_NAMES
+from tpo_normal_layer import compute_tpo_memory_state, is_degenerate_atr
 
 _MAX_TPO_BARS = 500_000
+_LOGGER = logging.getLogger(__name__)
 
 
 def compute_rolling_volatility(close: np.ndarray, window: int = 24) -> np.ndarray:
@@ -59,14 +62,16 @@ def compute_tpo_feature_panel(
         lower_close = np.asarray(lower_close, dtype=np.float64)
         lower_lookup = np.asarray(lower_lookup, dtype=np.int32)
 
-    atr_proxy = np.maximum(np.abs(high - low), np.maximum(np.abs(close - np.roll(close, 1)), 1e-8))
-    atr_proxy[0] = max(float(high[0] - low[0]), 1e-8)
-    atr_csum = np.concatenate(([0.0], np.cumsum(atr_proxy, dtype=np.float64)))
+    atr_proxy_raw = np.maximum(np.abs(high - low), np.abs(close - np.roll(close, 1)))
+    atr_proxy_raw[0] = float(high[0] - low[0])
+    atr_csum = np.concatenate(([0.0], np.cumsum(atr_proxy_raw, dtype=np.float64)))
     atr_idx = np.arange(n_bars, dtype=np.int64)
     atr_start = np.maximum(0, atr_idx - 13)
     atr_count = (atr_idx - atr_start + 1).astype(np.float64)
     atr_mean = (atr_csum[atr_idx + 1] - atr_csum[atr_start]) / atr_count
     lower_lookup = np.clip(lower_lookup, 0, len(lower_close) - 1)
+    degenerate_skips = 0
+    considered_bars = 0
 
     for idx in range(n_bars):
         lower_end = int(lower_lookup[min(idx, len(lower_lookup) - 1)])
@@ -76,12 +81,16 @@ def compute_tpo_feature_panel(
         sub_close = lower_close[start : lower_end + 1]
         if len(sub_close) < 8:
             continue
+        considered_bars += 1
         atr_price = float(atr_mean[idx])
+        if is_degenerate_atr(atr_price):
+            degenerate_skips += 1
+            continue
         state = compute_tpo_memory_state(
             high=sub_high,
             low=sub_low,
             close=sub_close,
-            atr_price=max(atr_price, 1e-8),
+            atr_price=atr_price,
             lookbacks=lookbacks,
         )
         profile = state.composite_profile
@@ -98,4 +107,14 @@ def compute_tpo_feature_panel(
             ],
             dtype=np.float32,
         )
+    if considered_bars > 0:
+        skip_ratio = float(degenerate_skips / considered_bars)
+        if skip_ratio > 0.05:
+            _LOGGER.info(
+                "state=tpo_degenerate_atr_skips skipped=%s considered=%s ratio=%.4f threshold=%.1e",
+                degenerate_skips,
+                considered_bars,
+                skip_ratio,
+                ATR_MIN_THRESHOLD,
+            )
     return features, volatility

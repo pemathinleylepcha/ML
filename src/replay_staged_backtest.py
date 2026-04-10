@@ -10,7 +10,7 @@ import torch
 
 from staged_v4.config import BacktestConfig, FX_TRADABLE_NAMES, STGNNBlockConfig, SubnetConfig, TrainingConfig
 from staged_v4.contracts import CalibrationArtifact
-from staged_v4.data import load_staged_panels
+from staged_v4.data import load_feature_batches, load_staged_panels
 from staged_v4.evaluation.backtest import adjusted_backtest_config, backtest_probabilities
 from staged_v4.evaluation.metrics import (
     binary_accuracy,
@@ -21,7 +21,7 @@ from staged_v4.evaluation.metrics import (
     summarize_fold_metrics,
 )
 from staged_v4.models import BTCSubnet, ConditionalBridge, FXSubnet
-from staged_v4.training.train_staged import DEFAULT_SEQ_LENS, _collect_anchor_outputs
+from staged_v4.training.train_staged import DEFAULT_SEQ_LENS, _collect_anchor_outputs, _resolve_cached_splits
 from staged_v4.utils.calibration_helpers import apply_platt_scaler
 from staged_v4.utils.runtime_logging import configure_logging, log_exception, stage_context, write_status
 
@@ -35,14 +35,22 @@ def _merge_dataclass_config(cls, payload: dict | None):
     return cls(**merged)
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def replay_backtest(
     run_dir: str,
-    candle_root: str,
+    candle_root: str | None,
     tick_root: str | None,
-    start: str,
-    end: str,
+    start: str | None,
+    end: str | None,
     output: str | None = None,
     *,
+    cache_root: str | None = None,
     strict: bool = False,
     max_workers: int = 0,
     device_override: str = "cpu",
@@ -83,43 +91,103 @@ def replay_backtest(
     if resolved_device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available on this host")
     device = torch.device(resolved_device)
+    logger.info("state=device_selected device=%s cuda_available=%s", device.type, torch.cuda.is_available())
 
-    with stage_context(
-        logger,
-        status_file,
-        "load_staged_panels",
-        candle_root=candle_root,
-        tick_root=tick_root,
-        start=start,
-        end=end,
-        max_workers=max_workers,
-        run_dir=str(run_path),
-    ):
-        btc_panels, fx_panels = load_staged_panels(
+    feature_mode = "prebuilt"
+    cache_manifest: dict[str, object] = {}
+    if cache_root is not None:
+        cache_root_path = Path(cache_root)
+        cache_manifest_path = cache_root_path / "manifest.json"
+        if cache_manifest_path.exists():
+            cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+        with stage_context(
+            logger,
+            status_file,
+            "load_feature_batches",
+            cache_root=cache_root,
+            run_dir=str(run_path),
+        ):
+            btc_panels, fx_panels, cached_splits, split_meta = load_feature_batches(cache_root)
+            splits, split_frequency = _resolve_cached_splits(
+                fx_panels.anchor_timestamps,
+                cached_splits,
+                split_meta,
+                training_cfg,
+                logger,
+                status_file,
+            )
+            split_source = "regenerated" if splits is not cached_splits else "cached"
+            logger.info(
+                "state=replay_splits_resolved n_splits=%d split_frequency=%s source=%s",
+                len(splits),
+                split_frequency,
+                split_source,
+            )
+            loaded_timeframes = tuple(fx_panels.timeframe_batches.keys())
+            if tuple(subnet_cfg.timeframe_order) != loaded_timeframes:
+                subnet_cfg = SubnetConfig(
+                    timeframe_order=loaded_timeframes,
+                    exchange_every_k_batches=subnet_cfg.exchange_every_k_batches,
+                    active_loss_boost=subnet_cfg.active_loss_boost,
+                    enable_entry_head=subnet_cfg.enable_entry_head,
+                )
+            timeframes = loaded_timeframes
+        if start is None:
+            start = cache_manifest.get("start") if cache_manifest else None
+        if end is None:
+            end = cache_manifest.get("end") if cache_manifest else None
+        if start is None and len(fx_panels.anchor_timestamps):
+            start = str(fx_panels.anchor_timestamps[0])
+        if end is None and len(fx_panels.anchor_timestamps):
+            end = str(fx_panels.anchor_timestamps[-1])
+        feature_mode = "cached"
+        logger.info("state=feature_mode mode=%s cache_root=%s", feature_mode, cache_root)
+    else:
+        if candle_root is None:
+            raise ValueError("candle_root is required when cache_root is not provided")
+        if start is None or end is None:
+            raise ValueError("start and end are required when replaying from raw panels")
+        with stage_context(
+            logger,
+            status_file,
+            "load_staged_panels",
             candle_root=candle_root,
             tick_root=tick_root,
             start=start,
             end=end,
-            anchor_timeframe=training_cfg.anchor_timeframe,
-            strict=strict,
-            timeframes=timeframes,
-            split_frequency=training_cfg.split_frequency,
-            outer_holdout_blocks=training_cfg.outer_holdout_blocks,
-            min_train_blocks=training_cfg.min_train_blocks,
-            purge_bars=training_cfg.purge_bars,
-            logger=logger,
-            status_file=status_file,
             max_workers=max_workers,
-            memory_guard_min_available_mb=training_cfg.memory_guard_min_available_mb,
-            memory_guard_critical_available_mb=training_cfg.memory_guard_critical_available_mb,
-        )
+            run_dir=str(run_path),
+        ):
+            btc_panels, fx_panels = load_staged_panels(
+                candle_root=candle_root,
+                tick_root=tick_root,
+                start=start,
+                end=end,
+                anchor_timeframe=training_cfg.anchor_timeframe,
+                strict=strict,
+                timeframes=timeframes,
+                split_frequency=training_cfg.split_frequency,
+                outer_holdout_blocks=training_cfg.outer_holdout_blocks,
+                min_train_blocks=training_cfg.min_train_blocks,
+                purge_bars=training_cfg.purge_bars,
+                logger=logger,
+                status_file=status_file,
+                max_workers=max_workers,
+                memory_guard_min_available_mb=training_cfg.memory_guard_min_available_mb,
+                memory_guard_critical_available_mb=training_cfg.memory_guard_critical_available_mb,
+            )
+        splits = list(fx_panels.walkforward_splits)
+        split_frequency = training_cfg.split_frequency
+        logger.info("state=feature_mode mode=%s", feature_mode)
 
-    splits = list(fx_panels.walkforward_splits)
     n_folds = min(len(checkpoint_paths), len(splits))
     splits = splits[:n_folds]
     checkpoint_paths = checkpoint_paths[:n_folds]
     logger.info("state=replay_splits n_splits=%d checkpoints=%d device=%s", len(splits), len(checkpoint_paths), device.type)
     write_status(status_file, {"state": "running", "stage": "replay_start", "fold_total": len(splits), "device": device.type})
+
+    output_path = Path(output) if output else (run_path / "report_bundle_c_replay.json")
+    partial_output_path = output_path.with_name(output_path.stem + "_partial.json")
 
     fold_results: list[dict] = []
     for fold_index, (split, checkpoint_path) in enumerate(zip(splits, checkpoint_paths)):
@@ -204,6 +272,30 @@ def replay_backtest(
             fold_result["net_return"],
             fold_result["trade_count"],
         )
+        partial_report = {
+            "mode": "replay_backtest_partial",
+            "source_run_dir": str(run_path),
+            "source_report": str(base_report_path),
+            "cache_root": cache_root,
+            "candle_root": candle_root,
+            "tick_root": tick_root,
+            "start": start,
+            "end": end,
+            "timeframes": list(timeframes),
+            "training_config": asdict(training_cfg),
+            "subnet_config": asdict(subnet_cfg),
+            "block_config": asdict(block_cfg),
+            "backtest_config": asdict(backtest_cfg),
+            "source_backtest_config": source_backtest_cfg,
+            "include_signal_only_tpo": include_signal_only_tpo,
+            "feature_mode": feature_mode,
+            "cache_manifest": cache_manifest,
+            "completed_folds": len(fold_results),
+            "fold_results": fold_results,
+            "summary": summarize_fold_metrics(fold_results) if fold_results else {},
+            "baseline_summary": base_report.get("summary", {}),
+        }
+        _write_json_atomic(partial_output_path, partial_report)
         write_status(status_file, {"state": "running", "stage": "replay_fold_complete", "fold": fold_index, "fold_result": fold_result})
 
     summary = summarize_fold_metrics(fold_results)
@@ -225,6 +317,7 @@ def replay_backtest(
         "mode": "replay_backtest",
         "source_run_dir": str(run_path),
         "source_report": str(base_report_path),
+        "cache_root": cache_root,
         "candle_root": candle_root,
         "tick_root": tick_root,
         "start": start,
@@ -236,14 +329,15 @@ def replay_backtest(
         "backtest_config": asdict(backtest_cfg),
         "source_backtest_config": source_backtest_cfg,
         "include_signal_only_tpo": include_signal_only_tpo,
+        "feature_mode": feature_mode,
+        "cache_manifest": cache_manifest,
+        "split_frequency": split_frequency,
         "fold_results": fold_results,
         "summary": summary,
         "acceptance": acceptance,
         "baseline_summary": base_report.get("summary", {}),
     }
-    output_path = Path(output) if output else (run_path / "report_bundle_c_replay.json")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(replay_report, indent=2), encoding="utf-8")
+    _write_json_atomic(output_path, replay_report)
     write_status(status_file, {"state": "completed", "stage": "replay_backtest", "summary": summary, "output": str(output_path), "acceptance": acceptance})
     return replay_report
 
@@ -251,10 +345,11 @@ def replay_backtest(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay staged_v4 backtests from saved fold checkpoints.")
     parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--candle-root", required=True)
+    parser.add_argument("--cache-root", default=None)
+    parser.add_argument("--candle-root", default=None)
     parser.add_argument("--tick-root", default=None)
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
+    parser.add_argument("--start", default=None)
+    parser.add_argument("--end", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--max-workers", type=int, default=0)
@@ -263,9 +358,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-file", default=None)
     args = parser.parse_args(argv)
 
+    if args.cache_root and (args.candle_root or args.tick_root):
+        parser.error("--cache-root cannot be combined with --candle-root/--tick-root")
+    if not args.cache_root and not args.candle_root:
+        parser.error("either --cache-root or --candle-root is required")
+
     try:
         replay_backtest(
             run_dir=args.run_dir,
+            cache_root=args.cache_root,
             candle_root=args.candle_root,
             tick_root=args.tick_root,
             start=args.start,
@@ -279,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         logger = configure_logging("replay_staged_backtest", log_file=args.log_file)
-        log_exception(logger, "replay_staged_backtest", exc, status_file=args.status_file)
+        log_exception(logger, args.status_file, "replay_staged_backtest", exc)
         return 1
     return 0
 

@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-train-blocks", type=int, default=2)
     parser.add_argument("--purge-bars", type=int, default=6)
     parser.add_argument("--max-workers", type=int, default=0, help="Parallel symbol-load workers; 0 = auto")
+    parser.add_argument("--panel-load-workers", type=int, default=0, help="Panel load workers only; 0 = use --max-workers")
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--status-file", default=None)
     args = parser.parse_args(argv)
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_train_blocks=args.min_train_blocks,
                 purge_bars=args.purge_bars,
                 max_workers=args.max_workers,
+                panel_load_workers=args.panel_load_workers,
                 logger=logger,
                 status_file=args.status_file,
             )

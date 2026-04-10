@@ -326,7 +326,10 @@ def _iter_relevant_quarters(candle_root: Path, start_ts: pd.Timestamp | None, en
 def _align_frames(frames: dict[str, pd.DataFrame], expected_symbols: tuple[str, ...] | None = None) -> dict[str, pd.DataFrame]:
     if not frames:
         return {}
-    union_index = pd.Index(sorted({ts for frame in frames.values() for ts in frame.index}), name="dt")
+    union_index = frames[next(iter(frames))].index
+    for frame in frames.values():
+        union_index = union_index.union(frame.index)
+    union_index.name = "dt"
     aligned: dict[str, pd.DataFrame] = {}
     symbols = expected_symbols or tuple(frames.keys())
     for symbol in symbols:
@@ -738,10 +741,40 @@ def load_staged_panels(
         memory_guard_min_available_mb=memory_guard_min_available_mb,
         memory_guard_critical_available_mb=memory_guard_critical_available_mb,
     )
+    if logger is not None:
+        logger.info(
+            "state=post_panel_load anchor_timeframe=%s btc_timeframes=%s fx_timeframes=%s",
+            anchor_timeframe,
+            ",".join(sorted(btc_panels.keys())),
+            ",".join(sorted(fx_panels.keys())),
+        )
     anchor_source = fx_panels[anchor_timeframe] if fx_panels.get(anchor_timeframe) else btc_panels[anchor_timeframe]
     if not anchor_source:
         raise ValueError(f"No anchor timeframe data for {anchor_timeframe}")
+    if logger is not None:
+        anchor_subnet = "fx" if fx_panels.get(anchor_timeframe) else "btc"
+        logger.info(
+            "state=anchor_source_ready subnet=%s timeframe=%s symbols=%d",
+            anchor_subnet,
+            anchor_timeframe,
+            len(anchor_source),
+        )
     anchor_timestamps = next(iter(anchor_source.values())).index.astype("datetime64[ns]").to_numpy()
+    if logger is not None:
+        logger.info(
+            "state=anchor_timestamps_ready timeframe=%s count=%d start=%s end=%s",
+            anchor_timeframe,
+            len(anchor_timestamps),
+            anchor_timestamps[0] if len(anchor_timestamps) else None,
+            anchor_timestamps[-1] if len(anchor_timestamps) else None,
+        )
+        logger.info(
+            "state=build_walkforward_splits_start split_frequency=%s outer_holdout_blocks=%d min_train_blocks=%d purge_bars=%d",
+            split_frequency,
+            outer_holdout_blocks,
+            min_train_blocks,
+            purge_bars,
+        )
     walkforward_splits = build_walkforward_splits(
         anchor_timestamps,
         split_frequency=split_frequency,
@@ -749,15 +782,54 @@ def load_staged_panels(
         min_train_blocks=min_train_blocks,
         purge_bars=purge_bars,
     )
+    if logger is not None:
+        logger.info(
+            "state=build_walkforward_splits_done splits=%d first_val_block=%s last_val_block=%s",
+            len(walkforward_splits),
+            walkforward_splits[0]["val_block"] if walkforward_splits else None,
+            walkforward_splits[-1]["val_block"] if walkforward_splits else None,
+        )
 
     def _make(subnet_name: str, symbols: tuple[str, ...], panels: dict[str, dict[str, pd.DataFrame]]) -> StagedPanels:
+        if logger is not None:
+            logger.info(
+                "state=make_panels_start subnet=%s timeframes=%s anchor_count=%d",
+                subnet_name,
+                ",".join(sorted(panels.keys())),
+                len(anchor_timestamps),
+            )
         lookup = {}
         for timeframe, symbol_map in panels.items():
             if symbol_map:
                 tf_index = next(iter(symbol_map.values())).index
+                if logger is not None:
+                    logger.info(
+                        "state=anchor_lookup_start subnet=%s timeframe=%s symbols=%d tf_rows=%d",
+                        subnet_name,
+                        timeframe,
+                        len(symbol_map),
+                        len(tf_index),
+                    )
                 lookup[timeframe] = _build_anchor_lookup(anchor_timestamps, tf_index)
+                if logger is not None:
+                    tf_lookup = lookup[timeframe]
+                    logger.info(
+                        "state=anchor_lookup_done subnet=%s timeframe=%s lookup_len=%d lookup_min=%d lookup_max=%d",
+                        subnet_name,
+                        timeframe,
+                        len(tf_lookup),
+                        int(tf_lookup.min()) if len(tf_lookup) else 0,
+                        int(tf_lookup.max()) if len(tf_lookup) else 0,
+                    )
             else:
                 lookup[timeframe] = np.zeros(len(anchor_timestamps), dtype=np.int32)
+                if logger is not None:
+                    logger.info(
+                        "state=anchor_lookup_empty subnet=%s timeframe=%s anchor_count=%d",
+                        subnet_name,
+                        timeframe,
+                        len(anchor_timestamps),
+                    )
         tpo_panels = (
             _presweep_tpo(panels, symbols, requested_timeframes, logger=logger, max_workers=max_workers)
             if enable_tpo_presweep
@@ -765,6 +837,14 @@ def load_staged_panels(
         )
         if logger is not None and not enable_tpo_presweep:
             logger.info("state=tpo_presweep source_tf=skip reason=disabled_for_callsite subnet=%s", subnet_name)
+        if logger is not None:
+            logger.info(
+                "state=make_panels_done subnet=%s lookups=%s splits=%d tpo_timeframes=%s",
+                subnet_name,
+                ",".join(sorted(lookup.keys())),
+                len(walkforward_splits),
+                ",".join(sorted(tpo_panels.keys())),
+            )
         return StagedPanels(
             subnet_name=subnet_name,
             symbols=symbols,
@@ -777,7 +857,17 @@ def load_staged_panels(
             tpo_panels=tpo_panels,
         )
 
-    return _make("btc", BTC_NODE_NAMES, btc_panels), _make("fx", FX_NODE_NAMES, fx_panels)
+    if logger is not None:
+        logger.info("state=load_staged_panels_make_start subnet=btc")
+    btc_staged = _make("btc", BTC_NODE_NAMES, btc_panels)
+    if logger is not None:
+        logger.info("state=load_staged_panels_make_done subnet=btc")
+        logger.info("state=load_staged_panels_make_start subnet=fx")
+    fx_staged = _make("fx", FX_NODE_NAMES, fx_panels)
+    if logger is not None:
+        logger.info("state=load_staged_panels_make_done subnet=fx")
+        logger.info("state=load_staged_panels_return btc_splits=%d fx_splits=%d", len(btc_staged.walkforward_splits), len(fx_staged.walkforward_splits))
+    return btc_staged, fx_staged
 
 
 def generate_synthetic_panels(
