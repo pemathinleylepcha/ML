@@ -16,3 +16,11 @@ DOC/IDEA-GRPO/
 DOC/compreseed/files.zip
 .claude/
 /README.md
+/scripts/
+/tmp_remote_collector/
+/remote_runs/
+/catboost_info/
+/datasets/
+/mt5/
+/src/live_dashboard.py
+/src/live_dashboard_local.py
