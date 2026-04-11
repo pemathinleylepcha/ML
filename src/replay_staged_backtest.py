@@ -42,6 +42,18 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp_path.replace(path)
 
 
+def _pbo_scalar(summary: dict) -> float | None:
+    value = summary.get("pbo")
+    if isinstance(value, dict):
+        value = value.get("pbo")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def replay_backtest(
     run_dir: str,
     candle_root: str | None,
@@ -54,20 +66,50 @@ def replay_backtest(
     strict: bool = False,
     max_workers: int = 0,
     device_override: str = "cpu",
+    backtest_overrides: dict | None = None,
     log_file: str | None = None,
     status_file: str | None = None,
 ) -> dict:
     run_path = Path(run_dir)
     base_report_path = run_path / "report.json"
-    if not base_report_path.exists():
-        raise FileNotFoundError(f"Base report not found: {base_report_path}")
     checkpoint_dir = run_path / "report"
-    checkpoint_paths = sorted(checkpoint_dir.glob("fold_*.pt"))
+    checkpoint_paths = sorted(checkpoint_dir.glob("fold_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
     if not checkpoint_paths:
         raise FileNotFoundError(f"No fold checkpoints found in {checkpoint_dir}")
 
     logger = configure_logging("replay_staged_backtest", log_file=log_file)
-    base_report = json.loads(base_report_path.read_text(encoding="utf-8"))
+    fallback_cache_manifest: dict[str, object] = {}
+    if cache_root is not None:
+        fallback_cache_manifest_path = Path(cache_root) / "manifest.json"
+        if fallback_cache_manifest_path.exists():
+            fallback_cache_manifest = json.loads(fallback_cache_manifest_path.read_text(encoding="utf-8"))
+    if base_report_path.exists():
+        base_report = json.loads(base_report_path.read_text(encoding="utf-8"))
+        source_report_path: str | None = str(base_report_path)
+    else:
+        checkpoint_preview = torch.load(checkpoint_paths[0], map_location="cpu")
+        checkpoint_fold_result = dict(checkpoint_preview.get("fold_result", {}))
+        fallback_training_cfg = asdict(TrainingConfig())
+        if fallback_cache_manifest:
+            for key in ("anchor_timeframe", "split_frequency", "outer_holdout_blocks", "min_train_blocks", "purge_bars"):
+                if key in fallback_cache_manifest:
+                    fallback_training_cfg[key] = fallback_cache_manifest[key]
+        fallback_timeframes = fallback_cache_manifest.get("fx_timeframes") or list(SubnetConfig().timeframe_order)
+        base_report = {
+            "training_config": fallback_training_cfg,
+            "subnet_config": asdict(SubnetConfig()),
+            "block_config": asdict(STGNNBlockConfig()),
+            "backtest_config": checkpoint_fold_result.get("backtest_cfg", {}),
+            "summary": {},
+            "timeframes": fallback_timeframes,
+            "include_signal_only_tpo": bool(fallback_cache_manifest.get("include_signal_only_tpo", True)),
+        }
+        source_report_path = None
+        logger.warning(
+            "state=base_report_missing_fallback run_dir=%s checkpoint=%s",
+            run_path,
+            checkpoint_paths[0].name,
+        )
     training_cfg = _merge_dataclass_config(TrainingConfig, base_report.get("training_config"))
     subnet_cfg = _merge_dataclass_config(SubnetConfig, base_report.get("subnet_config"))
     block_cfg = _merge_dataclass_config(STGNNBlockConfig, base_report.get("block_config"))
@@ -75,6 +117,10 @@ def replay_backtest(
     # so execution-only bundles can be validated against frozen model checkpoints.
     source_backtest_cfg = base_report.get("backtest_config", {})
     backtest_cfg = BacktestConfig()
+    if backtest_overrides:
+        for key, value in backtest_overrides.items():
+            if hasattr(backtest_cfg, key):
+                setattr(backtest_cfg, key, value)
     timeframes = tuple(base_report.get("timeframes", list(subnet_cfg.timeframe_order)))
     if tuple(subnet_cfg.timeframe_order) != timeframes:
         subnet_cfg = SubnetConfig(
@@ -275,7 +321,7 @@ def replay_backtest(
         partial_report = {
             "mode": "replay_backtest_partial",
             "source_run_dir": str(run_path),
-            "source_report": str(base_report_path),
+            "source_report": source_report_path,
             "cache_root": cache_root,
             "candle_root": candle_root,
             "tick_root": tick_root,
@@ -286,6 +332,7 @@ def replay_backtest(
             "subnet_config": asdict(subnet_cfg),
             "block_config": asdict(block_cfg),
             "backtest_config": asdict(backtest_cfg),
+            "backtest_overrides": backtest_overrides or {},
             "source_backtest_config": source_backtest_cfg,
             "include_signal_only_tpo": include_signal_only_tpo,
             "feature_mode": feature_mode,
@@ -304,19 +351,20 @@ def replay_backtest(
     trade_count_reduction = 0.0
     if baseline_mean_trade_count > 0.0:
         trade_count_reduction = 1.0 - (replay_mean_trade_count / baseline_mean_trade_count)
+    pbo_value = _pbo_scalar(summary)
     acceptance = {
         "mean_trade_count_drop_gte_40pct": bool(trade_count_reduction >= 0.40),
         "mean_sharpe_gte_6": bool(summary.get("mean_sharpe", -999.0) >= 6.0),
         "worst_fold_sharpe_gt_neg2": bool(summary.get("worst_fold_sharpe", -999.0) > -2.0),
         "all_fold_net_return_gt_neg1": bool(all(fr.get("net_return", -999.0) > -1.0 for fr in fold_results)),
-        "pbo_lt_0_55": bool((summary.get("pbo", 1.0) or 1.0) < 0.55),
+        "pbo_lt_0_55": bool((pbo_value if pbo_value is not None else 1.0) < 0.55),
         "trade_count_reduction": float(trade_count_reduction),
         "baseline_mean_trade_count": baseline_mean_trade_count,
     }
     replay_report = {
         "mode": "replay_backtest",
         "source_run_dir": str(run_path),
-        "source_report": str(base_report_path),
+        "source_report": source_report_path,
         "cache_root": cache_root,
         "candle_root": candle_root,
         "tick_root": tick_root,
@@ -327,6 +375,7 @@ def replay_backtest(
         "subnet_config": asdict(subnet_cfg),
         "block_config": asdict(block_cfg),
         "backtest_config": asdict(backtest_cfg),
+        "backtest_overrides": backtest_overrides or {},
         "source_backtest_config": source_backtest_cfg,
         "include_signal_only_tpo": include_signal_only_tpo,
         "feature_mode": feature_mode,
@@ -354,6 +403,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--max-workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
+    parser.add_argument("--base-entry-threshold", type=float, default=None)
+    parser.add_argument("--max-hold-bars", type=int, default=None)
+    parser.add_argument("--max-loss-pct-per-trade", type=float, default=None)
+    parser.add_argument("--stop-loss-atr", type=float, default=None)
+    parser.add_argument("--trailing-activate-atr", type=float, default=None)
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--status-file", default=None)
     args = parser.parse_args(argv)
@@ -364,6 +418,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("either --cache-root or --candle-root is required")
 
     try:
+        backtest_overrides = {}
+        if args.base_entry_threshold is not None:
+            backtest_overrides["base_entry_threshold"] = args.base_entry_threshold
+        if args.max_hold_bars is not None:
+            backtest_overrides["max_hold_bars"] = args.max_hold_bars
+        if args.max_loss_pct_per_trade is not None:
+            backtest_overrides["max_loss_pct_per_trade"] = args.max_loss_pct_per_trade
+        if args.stop_loss_atr is not None:
+            backtest_overrides["stop_loss_atr"] = args.stop_loss_atr
+        if args.trailing_activate_atr is not None:
+            backtest_overrides["trailing_activate_atr"] = args.trailing_activate_atr
         replay_backtest(
             run_dir=args.run_dir,
             cache_root=args.cache_root,
@@ -375,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             strict=args.strict,
             max_workers=args.max_workers,
             device_override=args.device,
+            backtest_overrides=backtest_overrides,
             log_file=args.log_file,
             status_file=args.status_file,
         )
