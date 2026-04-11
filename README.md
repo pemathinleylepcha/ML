@@ -57,3 +57,8 @@ These are not separate products. They are simply different shelves in the same m
 
 This repository keeps the git-facing overview intentionally lightweight.
 The detailed thinking, planning, and historical context live under `DOC/`.
+
+## Project Policy
+
+- License: see `LICENSE`
+- Security reporting: see `SECURITY.md`
