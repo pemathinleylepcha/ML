@@ -2,6 +2,9 @@ data/
 models/
 __pycache__/
 *.pyc
+*.ps1
+*.bat
+*.sh
 .env
 *.json
 !package.json
