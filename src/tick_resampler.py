@@ -52,12 +52,101 @@ except ImportError:
 
 # ── CSV parsing (tick format) ─────────────────────────────────────────────────
 
+_REQUIRED_TICK_COLUMNS = ("BID", "ASK")
+
+
+def _canonical_tick_column(name: object) -> str:
+    text = str(name).strip().strip("\ufeff").strip().strip('"').strip("'")
+    return text.strip("<>").upper()
+
+
+def _detect_tick_csv_encoding(filepath: Path) -> str:
+    head = filepath.read_bytes()[:4096]
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    try:
+        head.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "latin-1"
+
+
+def _detect_tick_csv_separator(filepath: Path, encoding: str) -> str:
+    with open(filepath, "r", encoding=encoding, errors="replace") as fh:
+        for line in fh:
+            text = line.strip()
+            if not text:
+                continue
+            tab_count = text.count("\t")
+            comma_count = text.count(",")
+            if tab_count == 0 and comma_count == 0:
+                continue
+            return "\t" if tab_count > comma_count else ","
+    return ","
+
+
+def _read_mt5_tick_csv(filepath: Path, chunksize: int | None = None):
+    encoding = _detect_tick_csv_encoding(filepath)
+    separator = _detect_tick_csv_separator(filepath, encoding)
+    kwargs = {
+        "sep": separator,
+        "header": 0,
+        "dtype": str,
+        "engine": "python",
+        "encoding": encoding,
+        "on_bad_lines": "skip",
+        "skipinitialspace": True,
+        "keep_default_na": True,
+        "na_values": ["", " "],
+    }
+    if chunksize is not None:
+        kwargs["chunksize"] = chunksize
+    return pd.read_csv(filepath, **kwargs)
+
+
+def _normalize_tick_chunk(frame: pd.DataFrame, filepath: Path) -> pd.DataFrame:
+    renamed = frame.rename(columns={col: _canonical_tick_column(col) for col in frame.columns})
+    missing = [col for col in _REQUIRED_TICK_COLUMNS if col not in renamed.columns]
+    if missing:
+        raise ValueError(f"Missing required tick columns {missing} in {filepath}")
+    if "FLAGS" not in renamed.columns:
+        renamed["FLAGS"] = "6"
+    has_timestamp = (
+        ("TIME_MSC" in renamed.columns)
+        or ("TIME_SEC" in renamed.columns)
+        or ("DATE" in renamed.columns and "TIME" in renamed.columns)
+    )
+    if not has_timestamp:
+        raise ValueError(f"Missing required tick timestamp columns in {filepath}")
+    keep = [col for col in ("DATE", "TIME", "TIME_SEC", "TIME_MSC", "BID", "ASK", "FLAGS") if col in renamed.columns]
+    return renamed[keep].copy()
+
+
+def _parse_tick_datetime(frame: pd.DataFrame) -> pd.Series:
+    if "TIME_MSC" in frame.columns:
+        dt = pd.to_datetime(pd.to_numeric(frame["TIME_MSC"], errors="coerce"), unit="ms", errors="coerce")
+        if dt.notna().any():
+            return dt
+    if "TIME_SEC" in frame.columns:
+        dt = pd.to_datetime(frame["TIME_SEC"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
+        if dt.notna().any():
+            return dt
+    dt = pd.to_datetime(frame["DATE"] + " " + frame["TIME"], format="%Y.%m.%d %H:%M:%S.%f", errors="coerce")
+    if dt.notna().any():
+        return dt
+    return pd.to_datetime(frame["DATE"] + " " + frame["TIME"], errors="coerce")
+
 def parse_tick_csv(filepath: Path) -> pd.DataFrame:
     """
-    Parse an MT5 broker tick CSV (tab-separated) into a DataFrame.
+    Parse an MT5 broker tick CSV into a DataFrame.
 
-    Expected columns (tab-separated, with header row):
-        DATE  TIME  BID  ASK  LAST  VOLUME  FLAGS
+    Supported input quirks:
+        - tab- or comma-separated MT5 exports
+        - UTF-8, UTF-8 BOM, or UTF-16 encodings
+        - angle-bracket MT5 headers (<DATE>, <TIME>, ...)
+        - empty LAST / VOLUME fields on quote-only ticks
 
     FLAGS encoding:
         2 = bid tick only  (ask unchanged, ask is forward-filled)
@@ -67,20 +156,10 @@ def parse_tick_csv(filepath: Path) -> pd.DataFrame:
     Returns a DataFrame with columns:
         datetime, BID, ASK, mid, spread, FLAGS
     """
-    df = pd.read_csv(
-        filepath,
-        sep="\t",
-        header=0,
-        names=["DATE", "TIME", "BID", "ASK", "LAST", "VOLUME", "FLAGS"],
-        usecols=[0, 1, 2, 3, 6],
-        dtype={"DATE": str, "TIME": str},
-        na_values=["", " "],
-    )
+    df = _normalize_tick_chunk(_read_mt5_tick_csv(filepath), filepath)
 
-    df["datetime"] = pd.to_datetime(
-        df["DATE"] + " " + df["TIME"],
-        format="%Y.%m.%d %H:%M:%S.%f",
-    )
+    df["datetime"] = _parse_tick_datetime(df)
+    df = df.dropna(subset=["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
     df["BID"] = pd.to_numeric(df["BID"], errors="coerce")
@@ -118,21 +197,12 @@ def stream_resample_tick_csv(
     last_bid: float | None = None
     last_ask: float | None = None
 
-    reader = pd.read_csv(
-        filepath,
-        sep="\t",
-        header=0,
-        names=["DATE", "TIME", "BID", "ASK", "LAST", "VOLUME", "FLAGS"],
-        usecols=[0, 1, 2, 3, 6],
-        dtype={"DATE": str, "TIME": str},
-        na_values=["", " "],
-        chunksize=chunksize,
-        engine="python",
-    )
+    reader = _read_mt5_tick_csv(filepath, chunksize=chunksize)
 
     for chunk in reader:
         if chunk.empty:
             continue
+        chunk = _normalize_tick_chunk(chunk, filepath)
 
         bid = pd.to_numeric(chunk["BID"], errors="coerce")
         ask = pd.to_numeric(chunk["ASK"], errors="coerce")
@@ -157,11 +227,7 @@ def stream_resample_tick_csv(
         last_bid = float(bid.iloc[-1])
         last_ask = float(ask.iloc[-1])
 
-        datetimes = pd.to_datetime(
-            chunk["DATE"] + " " + chunk["TIME"],
-            format="%Y.%m.%d %H:%M:%S.%f",
-            errors="coerce",
-        )
+        datetimes = _parse_tick_datetime(chunk)
         valid_dt = datetimes.notna()
         if not valid_dt.any():
             continue
@@ -189,8 +255,8 @@ def stream_resample_tick_csv(
         mids = ((bid + ask) / 2.0).astype(np.float64)
         spreads = (ask - bid).astype(np.float64)
         sec = datetimes.dt.floor("s")
-        bid_tick = ((flags == 2) | (flags == 6)).astype(np.int32)
-        ask_tick = ((flags == 4) | (flags == 6)).astype(np.int32)
+        bid_tick = ((flags & 2) != 0).astype(np.int32)
+        ask_tick = ((flags & 4) != 0).astype(np.int32)
 
         chunk_df = pd.DataFrame(
             {
@@ -291,9 +357,9 @@ def resample_to_1000ms(ticks: pd.DataFrame, instrument: str) -> pd.DataFrame:
 
     # Bid/ask directional counts per bar
     # FLAGS=2: bid-side tick, FLAGS=4: ask-side tick, FLAGS=6: both sides
-    flags = ticks["FLAGS"]
-    bid_counts = flags.apply(lambda f: 1 if f == 2 else (1 if f == 6 else 0)).resample("1s").sum()
-    ask_counts = flags.apply(lambda f: 1 if f == 4 else (1 if f == 6 else 0)).resample("1s").sum()
+    flags = pd.to_numeric(ticks["FLAGS"], errors="coerce").fillna(6).astype(int)
+    bid_counts = ((flags & 2) != 0).astype(np.int32).resample("1s").sum()
+    ask_counts = ((flags & 4) != 0).astype(np.int32).resample("1s").sum()
 
     bars["_bid_cnt"] = bid_counts
     bars["_ask_cnt"] = ask_counts

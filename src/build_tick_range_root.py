@@ -14,8 +14,10 @@ from universe import ALL_INSTRUMENTS
 
 def _match_instrument(path: Path, instruments: tuple[str, ...]) -> str | None:
     stem_upper = path.stem.upper()
+    path_parts = [part.upper() for part in path.parts]
     for instrument in sorted(instruments, key=len, reverse=True):
-        if instrument.upper() in stem_upper:
+        symbol = instrument.upper()
+        if symbol in stem_upper or symbol in path_parts:
             return instrument
     return None
 
