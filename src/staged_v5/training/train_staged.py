@@ -18,6 +18,7 @@ from staged_v5.config import BacktestConfig, DEFAULT_SEQ_LENS, FX_TRADABLE_NAMES
 from staged_v5.contracts import FXFeatureBatch, SubnetSequenceBatch, TimeframeSequenceBatch
 from staged_v5.data import (
     StagedPanels,
+    assert_tick_root_ready,
     build_bridge_batches,
     build_btc_feature_batch,
     build_btc_sequence_batch_from_panels,
@@ -471,6 +472,28 @@ def _iter_batches(indices: np.ndarray, batch_size: int) -> list[np.ndarray]:
     return [indices[start : start + batch_size] for start in range(0, len(indices), batch_size)]
 
 
+def _tensorize_tick_batch(tick_batch: TimeframeSequenceBatch, device: torch.device) -> TimeframeSequenceBatch:
+    """Convert a JIT tick batch with numpy arrays to torch tensors on device."""
+    def _to_tensor(arr, dtype):
+        if isinstance(arr, torch.Tensor):
+            return arr.to(device=device, dtype=dtype)
+        return torch.tensor(np.asarray(arr), dtype=dtype, device=device)
+
+    return TimeframeSequenceBatch(
+        timeframe=tick_batch.timeframe,
+        node_names=tick_batch.node_names,
+        tradable_indices=tick_batch.tradable_indices,
+        timestamps=tick_batch.timestamps,
+        node_features=_to_tensor(tick_batch.node_features, torch.float32),
+        tpo_features=_to_tensor(tick_batch.tpo_features, torch.float32),
+        volatility=_to_tensor(tick_batch.volatility, torch.float32),
+        valid_mask=_to_tensor(tick_batch.valid_mask, torch.bool),
+        market_open_mask=_to_tensor(tick_batch.market_open_mask, torch.bool),
+        overlap_mask=_to_tensor(tick_batch.overlap_mask, torch.bool),
+        session_codes=_to_tensor(tick_batch.session_codes, torch.long),
+    )
+
+
 def _run_btc_forward(btc_subnet: BTCSubnet, btc_source, anchor_indices: np.ndarray, seq_lens: dict[str, int], device: torch.device, active_idx: int, batch_index: int):
     if isinstance(btc_source, StagedPanels):
         sequence_batch = build_btc_sequence_batch_from_panels(btc_source, anchor_indices, seq_lens, device)
@@ -492,6 +515,7 @@ def _run_fx_forward(
     active_idx: int,
     batch_index: int,
     include_signal_only_tpo: bool = True,
+    tick_loader=None,
 ):
     if isinstance(fx_source, StagedPanels):
         sequence_batch = build_fx_sequence_batch_from_panels(
@@ -503,9 +527,18 @@ def _run_fx_forward(
         )
     else:
         sequence_batch = _build_subnet_sequence_batch(fx_source, anchor_indices, seq_lens, device)
+
+    # Inject tick batch from JIT loader if available
+    if tick_loader is not None and "tick" not in sequence_batch.timeframe_batches:
+        anchor_timestamps = fx_source.anchor_timestamps[anchor_indices]
+        tick_batch = tick_loader.get_tick_sequence_batch(anchor_timestamps, device_type=device.type)
+        sequence_batch.timeframe_batches["tick"] = _tensorize_tick_batch(tick_batch, device)
+
     edges = _build_edge_tensors(sequence_batch, device)
     bridge_contexts = {}
     for timeframe, tf_batch in sequence_batch.timeframe_batches.items():
+        if timeframe not in btc_state.timeframe_states:
+            continue
         btc_context = btc_state.timeframe_states[timeframe].pooled_context
         overlap_mask = tf_batch.overlap_mask[:, -1]
         bridge_contexts[timeframe] = bridge(btc_context, overlap_mask, n_nodes=len(tf_batch.node_names))
@@ -523,6 +556,7 @@ def _collect_anchor_outputs(
     seq_lens: dict[str, int],
     device: torch.device,
     include_signal_only_tpo: bool = True,
+    tick_loader=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     btc_subnet.eval()
     fx_subnet.eval()
@@ -554,6 +588,7 @@ def _collect_anchor_outputs(
                 active_fx,
                 batch_index,
                 include_signal_only_tpo=include_signal_only_tpo,
+                tick_loader=tick_loader,
             )
             anchor_tf = fx_source.anchor_timeframe
             anchor_state = fx_state.timeframe_states[anchor_tf]
@@ -728,6 +763,7 @@ def run_staged_experiment(
     logger.info("state=device_selected device=%s cuda_available=%s", device.type, torch.cuda.is_available())
 
     feature_mode = "prebuilt"
+    requested_timeframes = tuple(subnet_cfg.timeframe_order)
     if cache_root is not None:
         with stage_context(logger, status_file, "load_feature_batches", cache_root=cache_root):
             btc_batch, fx_batch, cached_splits, split_meta = load_feature_batches(cache_root)
@@ -749,8 +785,11 @@ def run_staged_experiment(
             )
             loaded_timeframes = tuple(fx_batch.timeframe_batches.keys())
             if tuple(subnet_cfg.timeframe_order) != loaded_timeframes:
+                merged_timeframes = loaded_timeframes
+                if tick_root is not None and "tick" in requested_timeframes and "tick" not in loaded_timeframes:
+                    merged_timeframes = ("tick",) + tuple(tf for tf in loaded_timeframes if tf != "tick")
                 subnet_cfg = SubnetConfig(
-                    timeframe_order=loaded_timeframes,
+                    timeframe_order=merged_timeframes,
                     exchange_every_k_batches=subnet_cfg.exchange_every_k_batches,
                     active_loss_boost=subnet_cfg.active_loss_boost,
                     enable_entry_head=subnet_cfg.enable_entry_head,
@@ -821,7 +860,7 @@ def run_staged_experiment(
                 end=end,
                 anchor_timeframe=anchor_timeframe,
                 strict=strict,
-                timeframes=subnet_cfg.timeframe_order,
+                timeframes=tuple(tf for tf in subnet_cfg.timeframe_order if tf != "tick"),
                 split_frequency=training_cfg.split_frequency,
                 outer_holdout_blocks=training_cfg.outer_holdout_blocks,
                 min_train_blocks=training_cfg.min_train_blocks,
@@ -841,6 +880,34 @@ def run_staged_experiment(
     if not isinstance(fx_source, StagedPanels):
         _ = build_bridge_batches(btc_source, fx_source)
     logger.info("state=feature_mode mode=%s", feature_mode)
+
+    # Initialize JIT tick loader if tick is in timeframe_order and tick data is available
+    tick_loader = None
+    if "tick" in subnet_cfg.timeframe_order and tick_root is not None:
+        from staged_v5.data.jit_tick_loader import JITTickLoader
+
+        fx_node_names = getattr(fx_source, "node_names", None)
+        if fx_node_names is None:
+            fx_node_names = tuple(
+                fx_source.timeframe_batches[next(iter(fx_source.timeframe_batches))].node_names
+            )
+        preflight = assert_tick_root_ready(
+            tick_root=tick_root,
+            symbols=tuple(fx_node_names),
+            start=str(fx_source.anchor_timestamps[0]),
+            end=str(fx_source.anchor_timestamps[-1]),
+        )
+        tick_loader = JITTickLoader(
+            tick_root=tick_root,
+            node_names=fx_node_names,
+        )
+        logger.info(
+            "state=tick_loader_initialized chunk_bars=%d n_nodes=%d tick_start=%s tick_end=%s",
+            tick_loader.chunk_bars,
+            len(fx_node_names),
+            preflight.start,
+            preflight.end,
+        )
 
     splits = splits or _default_split(len(fx_source.anchor_timestamps), training_cfg.purge_bars)
     if max_folds is not None:
@@ -1025,6 +1092,7 @@ def run_staged_experiment(
                         fx_active,
                         batch_counter,
                         include_signal_only_tpo=include_signal_only_tpo,
+                        tick_loader=tick_loader,
                     )
                     loss = _compute_subnet_loss(
                         fx_state,
@@ -1098,6 +1166,7 @@ def run_staged_experiment(
                             fx_active,
                             batch_counter,
                             include_signal_only_tpo=include_signal_only_tpo,
+                            tick_loader=tick_loader,
                         )
                         loss = _compute_subnet_loss(
                             fx_state,
@@ -1138,6 +1207,7 @@ def run_staged_experiment(
             DEFAULT_SEQ_LENS,
             device,
             include_signal_only_tpo=include_signal_only_tpo,
+            tick_loader=tick_loader,
         )
         val_dir_logits, val_entry_logits, val_dir_labels, val_entry_labels, val_valid, close, high, low, volatility, session_codes = _collect_anchor_outputs(
             btc_subnet,
@@ -1149,6 +1219,7 @@ def run_staged_experiment(
             DEFAULT_SEQ_LENS,
             device,
             include_signal_only_tpo=include_signal_only_tpo,
+            tick_loader=tick_loader,
         )
         calib_dir_logits_flat = calib_dir_logits.reshape(-1)
         calib_entry_logits_flat = calib_entry_logits.reshape(-1)

@@ -70,6 +70,20 @@ TPO_FEATURE_NAMES = (
     "tpo_poc_drift_atr",
     "tpo_value_area_overlap",
 )
+VP_FEATURE_NAMES = (
+    "vp_poc_distance_atr",
+    "vp_value_area_width_atr",
+    "vp_high_volume_nodes",
+    "vp_poc_slope",
+)
+OF_FEATURE_NAMES = (
+    "of_delta",
+    "of_delta_cumulative_60",
+    "of_delta_cumulative_300",
+    "of_absorption_ratio",
+    "of_imbalance_streak",
+    "of_spread_compression",
+)
 ATR_MIN_THRESHOLD = 1e-6
 ATR_NORM_CLIP = 50.0  # max abs value for ATR-normalized TPO features
 EDGE_TYPES = ("rolling_corr", "fundamental", "session")
@@ -131,6 +145,16 @@ class TrainingConfig:
     use_torch_compile: bool = True
     gpu_memory_guard_min_mb: float = 4096.0
     gpu_memory_guard_critical_mb: float = 2048.0
+
+
+@dataclass(slots=True)
+class TickChunkConfig:
+    budget_fraction_ram: float = 0.25
+    budget_fraction_vram: float = 0.15
+    min_chunk_bars: int = 1_000
+    max_chunk_bars: int = 600_000
+    tick_seq_len: int = 120
+    prefetch: bool = True
 
 
 @dataclass(slots=True)

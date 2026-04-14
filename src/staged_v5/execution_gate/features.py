@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from research_dataset import SESSION_NAMES
+from staged_v5.config import VP_FEATURE_NAMES, OF_FEATURE_NAMES
 
 
 MICROSTRUCTURE_FEATURE_NAMES = (
@@ -195,4 +196,62 @@ def build_gate_state_vector(
     expected_dim = len(GATE_STATE_FEATURE_NAMES)
     if state.shape != (expected_dim,):
         raise ValueError(f"Expected gate state dim {expected_dim}, got {state.shape}")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# v5.2 gate state vector — VP + OF replacing TPO + microstructure
+# ---------------------------------------------------------------------------
+
+GATE_V2_STATE_FEATURE_NAMES = (
+    "prob_buy",
+    "prob_entry",
+    "atr",
+    "volatility",
+    *tuple(f"session_{name}" for name in SESSION_NAMES),
+    *VP_FEATURE_NAMES,
+    *OF_FEATURE_NAMES,
+)
+
+
+def build_gate_state_vector_v2(
+    *,
+    prob_buy: float,
+    prob_entry: float | None,
+    atr: float,
+    volatility: float,
+    session_code: int,
+    vp_features: np.ndarray,
+    of_features: np.ndarray,
+) -> np.ndarray:
+    """Build v5.2 gate state vector with VP + OF features.
+
+    Replaces v5.1's ``build_gate_state_vector`` which used TPO + microstructure.
+    """
+    vp = np.asarray(vp_features, dtype=np.float32)
+    of = np.asarray(of_features, dtype=np.float32)
+    if vp.shape != (len(VP_FEATURE_NAMES),):
+        raise ValueError(f"Expected {len(VP_FEATURE_NAMES)} VP features, got shape {vp.shape}")
+    if of.shape != (len(OF_FEATURE_NAMES),):
+        raise ValueError(f"Expected {len(OF_FEATURE_NAMES)} OF features, got shape {of.shape}")
+
+    state = np.concatenate(
+        [
+            np.asarray(
+                [
+                    float(prob_buy),
+                    float(0.5 if prob_entry is None else prob_entry),
+                    float(atr),
+                    float(volatility),
+                ],
+                dtype=np.float32,
+            ),
+            _session_one_hot(session_code),
+            vp,
+            of,
+        ]
+    )
+    expected_dim = len(GATE_V2_STATE_FEATURE_NAMES)
+    if state.shape != (expected_dim,):
+        raise ValueError(f"Expected gate v2 state dim {expected_dim}, got {state.shape}")
     return state

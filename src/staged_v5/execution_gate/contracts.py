@@ -42,6 +42,8 @@ class GateEvent:
     spread: float
     tick_count: float
     tpo_features: np.ndarray
+    vp_features: np.ndarray | None = None
+    of_features: np.ndarray | None = None
 
 
 @dataclass(slots=True)

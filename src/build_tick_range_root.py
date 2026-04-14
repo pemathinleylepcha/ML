@@ -22,9 +22,40 @@ def _match_instrument(path: Path, instruments: tuple[str, ...]) -> str | None:
     return None
 
 
-def _discover_files(raw_root: Path, instruments: tuple[str, ...]) -> dict[str, list[Path]]:
+def _relevant_quarter_keys(start: pd.Timestamp | None, end: pd.Timestamp | None) -> set[tuple[int, int]] | None:
+    if start is None or end is None:
+        return None
+    cursor = pd.Timestamp(year=start.year, month=((start.month - 1) // 3) * 3 + 1, day=1)
+    limit = pd.Timestamp(year=end.year, month=((end.month - 1) // 3) * 3 + 1, day=1)
+    keys: set[tuple[int, int]] = set()
+    while cursor <= limit:
+        keys.add((int(cursor.year), int(((cursor.month - 1) // 3) + 1)))
+        cursor = cursor + pd.offsets.QuarterBegin(startingMonth=1)
+    return keys
+
+
+def _path_quarter_key(path: Path) -> tuple[int, int] | None:
+    parts = list(path.parts)
+    for idx, part in enumerate(parts[:-1]):
+        if len(part) == 4 and part.isdigit():
+            next_part = parts[idx + 1].upper()
+            if next_part.startswith("Q") and next_part[1:].isdigit():
+                return int(part), int(next_part[1:])
+    return None
+
+
+def _discover_files(
+    raw_root: Path,
+    instruments: tuple[str, ...],
+    start_ts: pd.Timestamp | None,
+    end_ts: pd.Timestamp | None,
+) -> dict[str, list[Path]]:
     grouped: dict[str, list[Path]] = {instrument: [] for instrument in instruments}
+    relevant_quarters = _relevant_quarter_keys(start_ts, end_ts)
     for path in raw_root.rglob("*.csv"):
+        quarter_key = _path_quarter_key(path)
+        if relevant_quarters is not None and quarter_key is not None and quarter_key not in relevant_quarters:
+            continue
         instrument = _match_instrument(path, instruments)
         if instrument is None:
             continue
@@ -47,7 +78,7 @@ def build_tick_range_root(
     output_root.mkdir(parents=True, exist_ok=True)
     start_ts = pd.Timestamp(start) if start else None
     end_ts = pd.Timestamp(end) if end else None
-    discovered = _discover_files(raw_root, instruments)
+    discovered = _discover_files(raw_root, instruments, start_ts, end_ts)
     written: dict[str, str] = {}
     skipped: list[str] = []
     failures: list[dict[str, str]] = []
