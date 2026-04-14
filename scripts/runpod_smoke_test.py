@@ -123,11 +123,149 @@ def get_available_ram_mb_safe() -> float:
         return 4096.0
 
 
+def check_volume_sizes(
+    tick_root: str | None = None,
+    candle_root: str | None = None,
+    repo_root: str | None = None,
+) -> dict:
+    """Check disk usage for dataset dirs, repo, and free space on each mount."""
+    from pathlib import Path
+    import shutil
+
+    repo_root = repo_root or os.path.join(os.path.dirname(__file__), "..")
+    results: dict = {}
+
+    def _dir_size_mb(path: str) -> float | None:
+        p = Path(path)
+        if not p.exists():
+            return None
+        total = 0
+        for f in p.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+        return round(total / 1024 / 1024, 1)
+
+    def _file_count(path: str) -> int | None:
+        p = Path(path)
+        if not p.exists():
+            return None
+        return sum(1 for f in p.rglob("*") if f.is_file())
+
+    def _disk_free_mb(path: str) -> float | None:
+        try:
+            usage = shutil.disk_usage(path)
+            return round(usage.free / 1024 / 1024, 1)
+        except Exception:
+            return None
+
+    def _largest_files(path: str, n: int = 5) -> list[dict]:
+        p = Path(path)
+        if not p.exists():
+            return []
+        files = [(f, f.stat().st_size) for f in p.rglob("*") if f.is_file()]
+        files.sort(key=lambda x: x[1], reverse=True)
+        return [
+            {"name": str(f.name), "mb": round(sz / 1024 / 1024, 1)}
+            for f, sz in files[:n]
+        ]
+
+    # Repo size
+    repo_size = _dir_size_mb(repo_root)
+    results["repo"] = {
+        "path": str(repo_root),
+        "size_mb": repo_size,
+        "files": _file_count(repo_root),
+        "disk_free_mb": _disk_free_mb(repo_root),
+    }
+
+    # Src only
+    src_path = os.path.join(repo_root, "src")
+    results["src"] = {
+        "path": src_path,
+        "size_mb": _dir_size_mb(src_path),
+        "files": _file_count(src_path),
+    }
+
+    # Tick root
+    if tick_root:
+        results["tick_root"] = {
+            "path": tick_root,
+            "exists": Path(tick_root).exists(),
+            "size_mb": _dir_size_mb(tick_root),
+            "files": _file_count(tick_root),
+            "disk_free_mb": _disk_free_mb(tick_root),
+            "largest": _largest_files(tick_root),
+        }
+
+    # Candle root
+    if candle_root:
+        results["candle_root"] = {
+            "path": candle_root,
+            "exists": Path(candle_root).exists(),
+            "size_mb": _dir_size_mb(candle_root),
+            "files": _file_count(candle_root),
+            "disk_free_mb": _disk_free_mb(candle_root),
+            "largest": _largest_files(candle_root),
+        }
+
+    # Estimate minimum RunPod volume needed
+    data_total = 0.0
+    for key in ("tick_root", "candle_root"):
+        if key in results and results[key].get("size_mb"):
+            data_total += results[key]["size_mb"]
+    overhead_mb = (repo_size or 50) + 2000  # repo + pip packages + scratch
+    min_volume_gb = round((data_total + overhead_mb) / 1024 * 1.3, 1)  # 30% headroom
+    results["volume_recommendation"] = {
+        "data_total_mb": round(data_total, 1),
+        "overhead_mb": round(overhead_mb, 1),
+        "min_volume_gb": min_volume_gb,
+        "recommended_gb": max(min_volume_gb, 50),  # at least 50GB
+    }
+
+    return results
+
+
 def main():
     import json
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RunPod v5.2 smoke test")
+    parser.add_argument("--tick-root", type=str, default=None, help="Path to tick root directory")
+    parser.add_argument("--candle-root", type=str, default=None, help="Path to candle root directory")
+    args = parser.parse_args()
+
     results = {}
 
     print("=== RunPod v5.2 Smoke Test ===\n")
+
+    # 0. Volume / disk sizes
+    vol = check_volume_sizes(
+        tick_root=args.tick_root,
+        candle_root=args.candle_root,
+    )
+    results["volumes"] = vol
+    print("--- Volume Sizes ---")
+    print(f"  Repo: {vol['repo']['size_mb']} MB ({vol['repo']['files']} files) | disk free: {vol['repo']['disk_free_mb']} MB")
+    print(f"  Src:  {vol['src']['size_mb']} MB ({vol['src']['files']} files)")
+    if "tick_root" in vol:
+        tr = vol["tick_root"]
+        if tr["exists"]:
+            print(f"  Tick root: {tr['size_mb']} MB ({tr['files']} files) | disk free: {tr['disk_free_mb']} MB")
+            for f in tr.get("largest", [])[:3]:
+                print(f"    {f['name']}: {f['mb']} MB")
+        else:
+            print(f"  Tick root: NOT FOUND at {tr['path']}")
+    if "candle_root" in vol:
+        cr = vol["candle_root"]
+        if cr["exists"]:
+            print(f"  Candle root: {cr['size_mb']} MB ({cr['files']} files) | disk free: {cr['disk_free_mb']} MB")
+            for f in cr.get("largest", [])[:3]:
+                print(f"    {f['name']}: {f['mb']} MB")
+        else:
+            print(f"  Candle root: NOT FOUND at {cr['path']}")
+    rec = vol["volume_recommendation"]
+    print(f"  Volume recommendation: min {rec['min_volume_gb']} GB, recommended {rec['recommended_gb']} GB")
+    print()
 
     # 1. Core imports
     failed = check_imports()
