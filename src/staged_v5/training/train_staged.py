@@ -60,6 +60,20 @@ _DEFAULT_MEMORY_GUARD_CHECK_INTERVAL = int(_DEFAULT_TRAINING_CFG.memory_guard_ch
 _CUDA_MEMORY_GUARD_CHECK_INTERVAL = 50
 
 
+def _resolve_source_node_names(source: object) -> tuple[str, ...]:
+    node_names = getattr(source, "node_names", None)
+    if node_names is not None:
+        return tuple(node_names)
+    symbols = getattr(source, "symbols", None)
+    if symbols is not None:
+        return tuple(symbols)
+    timeframe_batches = getattr(source, "timeframe_batches", None)
+    if timeframe_batches:
+        first_batch = timeframe_batches[next(iter(timeframe_batches))]
+        return tuple(first_batch.node_names)
+    raise AttributeError(f"Could not resolve node names from source type {type(source).__name__}")
+
+
 def _default_split(n_items: int, purge_bars: int) -> list[dict[str, object]]:
     split = max(int(n_items * 0.7), 1)
     train_idx = np.arange(max(0, split - purge_bars), dtype=np.int32)
@@ -477,7 +491,10 @@ def _tensorize_tick_batch(tick_batch: TimeframeSequenceBatch, device: torch.devi
     def _to_tensor(arr, dtype):
         if isinstance(arr, torch.Tensor):
             return arr.to(device=device, dtype=dtype)
-        return torch.tensor(np.asarray(arr), dtype=dtype, device=device)
+        cpu_tensor = torch.tensor(np.ascontiguousarray(arr), dtype=dtype)
+        if device.type == "cuda":
+            return cpu_tensor.pin_memory().to(device, non_blocking=True)
+        return cpu_tensor
 
     return TimeframeSequenceBatch(
         timeframe=tick_batch.timeframe,
@@ -886,11 +903,7 @@ def run_staged_experiment(
     if "tick" in subnet_cfg.timeframe_order and tick_root is not None:
         from staged_v5.data.jit_tick_loader import JITTickLoader
 
-        fx_node_names = getattr(fx_source, "node_names", None)
-        if fx_node_names is None:
-            fx_node_names = tuple(
-                fx_source.timeframe_batches[next(iter(fx_source.timeframe_batches))].node_names
-            )
+        fx_node_names = _resolve_source_node_names(fx_source)
         preflight = assert_tick_root_ready(
             tick_root=tick_root,
             symbols=tuple(fx_node_names),
@@ -900,6 +913,7 @@ def run_staged_experiment(
         tick_loader = JITTickLoader(
             tick_root=tick_root,
             node_names=fx_node_names,
+            device_type=device.type,
         )
         logger.info(
             "state=tick_loader_initialized chunk_bars=%d n_nodes=%d tick_start=%s tick_end=%s",

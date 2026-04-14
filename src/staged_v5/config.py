@@ -152,7 +152,7 @@ class TickChunkConfig:
     budget_fraction_ram: float = 0.25
     budget_fraction_vram: float = 0.15
     min_chunk_bars: int = 1_000
-    max_chunk_bars: int = 600_000
+    max_chunk_bars: int = 2_000_000
     tick_seq_len: int = 120
     prefetch: bool = True
 

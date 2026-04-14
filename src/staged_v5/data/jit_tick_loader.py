@@ -9,7 +9,7 @@ import pandas as pd
 from research_dataset import SESSION_CODES, encode_session_codes
 from staged_v5.config import DEFAULT_SEQ_LENS
 from staged_v5.contracts import TimeframeSequenceBatch
-from staged_v5.data.memory_budget import compute_tick_chunk_size, get_available_ram_mb
+from staged_v5.data.memory_budget import compute_tick_chunk_size, get_available_ram_mb, get_available_vram_mb
 from staged_v5.data.tick_features import build_tick_raw_features
 from staged_v5.data.tpo_features import compute_tpo_feature_panel
 from staged_v5.execution_gate.features import TickProxyStore
@@ -103,26 +103,40 @@ class JITTickLoader:
         chunk_bars: int | None = None,
         tick_seq_len: int | None = None,
         budget_fraction_ram: float = 0.25,
+        budget_fraction_vram: float = 0.15,
         min_chunk_bars: int = 1_000,
-        max_chunk_bars: int = 600_000,
+        max_chunk_bars: int = 2_000_000,
+        device_type: str = "cpu",
     ):
         self.tick_root = Path(tick_root)
         self.node_names = tuple(node_names)
         self.tick_seq_len = int(tick_seq_len or DEFAULT_SEQ_LENS["tick"])
         self.tick_store = TickProxyStore(self.tick_root)
         available_ram_mb = get_available_ram_mb()
-        self.chunk_bars = int(
-            chunk_bars
-            if chunk_bars is not None
-            else compute_tick_chunk_size(
-                available_ram_mb=available_ram_mb,
+        ram_chunk = compute_tick_chunk_size(
+            available_ram_mb=available_ram_mb,
+            n_nodes=len(self.node_names),
+            n_features=22,
+            budget_fraction=budget_fraction_ram,
+            min_chunk_bars=min_chunk_bars,
+            max_chunk_bars=max_chunk_bars,
+        )
+        # On CUDA, also consider VRAM budget and take the larger of the two
+        # since tick chunks are loaded to CPU first then transferred to GPU
+        if device_type == "cuda":
+            vram_mb = get_available_vram_mb(device_type)
+            vram_chunk = compute_tick_chunk_size(
+                available_ram_mb=vram_mb,
                 n_nodes=len(self.node_names),
                 n_features=22,
-                budget_fraction=budget_fraction_ram,
+                budget_fraction=budget_fraction_vram,
                 min_chunk_bars=min_chunk_bars,
                 max_chunk_bars=max_chunk_bars,
             )
-        )
+            auto_chunk = max(ram_chunk, vram_chunk)
+        else:
+            auto_chunk = ram_chunk
+        self.chunk_bars = int(chunk_bars if chunk_bars is not None else auto_chunk)
         self._reference_symbol = self.node_names[0]
         self._reference_frame = self.tick_store.get_frame(self._reference_symbol)
         self._chunk_load_count = 0

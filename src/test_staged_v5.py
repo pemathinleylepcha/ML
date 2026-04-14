@@ -1490,6 +1490,25 @@ def test_neural_gate_backtest_smoke():
         print("PASS test_neural_gate_backtest_smoke")
 
 
+def test_resolve_source_node_names_for_staged_panels():
+    from staged_v5.data.dataset import StagedPanels
+    from staged_v5.training.train_staged import _resolve_source_node_names
+
+    panels = StagedPanels(
+        subnet_name="fx",
+        symbols=("EURUSD", "GBPUSD"),
+        anchor_timeframe="M1",
+        panels={},
+        anchor_timestamps=np.array([np.datetime64("2025-10-01T00:05:00")]),
+        anchor_lookup={},
+        walkforward_splits=[],
+        split_frequency="week",
+        tpo_panels={},
+    )
+    assert _resolve_source_node_names(panels) == ("EURUSD", "GBPUSD")
+    print("PASS test_resolve_source_node_names_for_staged_panels")
+
+
 _ALL_TESTS = [value for key, value in sorted(locals().items()) if key.startswith("test_")]
 
 if __name__ == "__main__":
