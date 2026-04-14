@@ -384,12 +384,12 @@ def _presweep_tpo(
             close = frame["c"].fillna(0.0).to_numpy(dtype=np.float32)
             return symbol, compute_tpo_feature_panel(high, low, close)
 
-        with ThreadPoolExecutor(max_workers=effective_workers, thread_name_prefix=f"tpo_{source_timeframe}") as executor:
-            futures = [executor.submit(_one, symbol) for symbol in symbols]
-            for future in as_completed(futures):
-                symbol, result = future.result()
-                if result is not None:
-                    tpo_panels[source_timeframe][symbol] = result
+        # Run TPO sequentially — compute_tpo_memory_state C extension is not
+        # thread-safe; concurrent ThreadPoolExecutor calls cause segfaults.
+        for symbol in symbols:
+            sym, result = _one(symbol)
+            if result is not None:
+                tpo_panels[source_timeframe][sym] = result
         if logger is not None:
             logger.info(
                 "state=tpo_presweep source_tf=%s symbols=%d workers=%d",
