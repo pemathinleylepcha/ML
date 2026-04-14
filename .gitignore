@@ -22,6 +22,7 @@ DOC/compreseed/files.zip
 .claude/
 /README.md
 /scripts/
+!/scripts/runpod_smoke_test.py
 /tmp_remote_collector/
 /remote_runs/
 /catboost_info/
