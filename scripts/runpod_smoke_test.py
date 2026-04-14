@@ -29,7 +29,8 @@ def check_cuda() -> dict:
     }
     if info["cuda_available"]:
         info["device_name"] = torch.cuda.get_device_name(0)
-        info["vram_total_mb"] = round(torch.cuda.get_device_properties(0).total_mem / 1024**2)
+        props = torch.cuda.get_device_properties(0)
+        info["vram_total_mb"] = round(getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1024**2)
         free, total = torch.cuda.mem_get_info(0)
         info["vram_free_mb"] = round(free / 1024**2)
         info["bf16_supported"] = torch.cuda.is_bf16_supported()
