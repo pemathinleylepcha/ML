@@ -126,6 +126,7 @@ def get_available_ram_mb_safe() -> float:
 def check_volume_sizes(
     tick_root: str | None = None,
     candle_root: str | None = None,
+    cache_root: str | None = None,
     repo_root: str | None = None,
 ) -> dict:
     """Check disk usage for dataset dirs, repo, and free space on each mount."""
@@ -208,9 +209,19 @@ def check_volume_sizes(
             "largest": _largest_files(candle_root),
         }
 
+    # Feature cache (optional)
+    if cache_root:
+        results["cache_root"] = {
+            "path": cache_root,
+            "exists": Path(cache_root).exists(),
+            "size_mb": _dir_size_mb(cache_root),
+            "files": _file_count(cache_root),
+            "disk_free_mb": _disk_free_mb(cache_root),
+        }
+
     # Estimate minimum RunPod volume needed
     data_total = 0.0
-    for key in ("tick_root", "candle_root"):
+    for key in ("tick_root", "candle_root", "cache_root"):
         if key in results and results[key].get("size_mb"):
             data_total += results[key]["size_mb"]
     overhead_mb = (repo_size or 50) + 2000  # repo + pip packages + scratch
@@ -230,9 +241,51 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="RunPod v5.2 smoke test")
-    parser.add_argument("--tick-root", type=str, default=None, help="Path to tick root directory")
-    parser.add_argument("--candle-root", type=str, default=None, help="Path to candle root directory")
+    parser.add_argument(
+        "--tick-root", type=str, default=None,
+        help="Path to tick root (default: auto-detect from known locations)",
+    )
+    parser.add_argument(
+        "--candle-root", type=str, default=None,
+        help="Path to candle root (default: auto-detect from known locations)",
+    )
+    parser.add_argument(
+        "--cache-root", type=str, default=None,
+        help="Path to feature cache (optional, speeds up training)",
+    )
     args = parser.parse_args()
+
+    # Auto-detect data paths from known locations (remote 172 box and RunPod mounts)
+    _KNOWN_TICK_ROOTS = [
+        "/data/ea_training_tickroot_v52_q4_20251001_20251231_1000ms",
+        "/workspace/data/ea_training_tickroot_v52_q4_20251001_20251231_1000ms",
+        "/runpod-volume/ea_training_tickroot_v52_q4_20251001_20251231_1000ms",
+        "D:/COLLECT-TICK-MT5/ea_training_tickroot_v52_q4_20251001_20251231_1000ms",
+    ]
+    _KNOWN_CANDLE_ROOTS = [
+        "/data/ea_training_bundle_6m_full44",
+        "/workspace/data/ea_training_bundle_6m_full44",
+        "/runpod-volume/ea_training_bundle_6m_full44",
+        "D:/COLLECT-TICK-MT5/ea_training_bundle_6m_full44",
+    ]
+    _KNOWN_CACHE_ROOTS = [
+        "/data/ea_training_cache_6m_full44_m1m5_v2",
+        "/workspace/data/ea_training_cache_6m_full44_m1m5_v2",
+        "/runpod-volume/ea_training_cache_6m_full44_m1m5_v2",
+        "D:/COLLECT-TICK-MT5/ea_training_cache_6m_full44_m1m5_v2",
+    ]
+
+    def _auto_detect(explicit, candidates):
+        if explicit:
+            return explicit
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        return None
+
+    tick_root = _auto_detect(args.tick_root, _KNOWN_TICK_ROOTS)
+    candle_root = _auto_detect(args.candle_root, _KNOWN_CANDLE_ROOTS)
+    cache_root = _auto_detect(args.cache_root, _KNOWN_CACHE_ROOTS)
 
     results = {}
 
@@ -240,8 +293,9 @@ def main():
 
     # 0. Volume / disk sizes
     vol = check_volume_sizes(
-        tick_root=args.tick_root,
-        candle_root=args.candle_root,
+        tick_root=tick_root,
+        candle_root=candle_root,
+        cache_root=cache_root,
     )
     results["volumes"] = vol
     print("--- Volume Sizes ---")
@@ -263,6 +317,14 @@ def main():
                 print(f"    {f['name']}: {f['mb']} MB")
         else:
             print(f"  Candle root: NOT FOUND at {cr['path']}")
+    if "cache_root" in vol:
+        cc = vol["cache_root"]
+        if cc["exists"]:
+            print(f"  Feature cache: {cc['size_mb']} MB ({cc['files']} files)")
+        else:
+            print(f"  Feature cache: NOT FOUND at {cc['path']}")
+    else:
+        print("  Feature cache: not specified (will build from candles, slower)")
     rec = vol["volume_recommendation"]
     print(f"  Volume recommendation: min {rec['min_volume_gb']} GB, recommended {rec['recommended_gb']} GB")
     print()
