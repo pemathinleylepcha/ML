@@ -25,6 +25,8 @@ DOC/compreseed/files.zip
 /README.md
 /scripts/
 !/scripts/runpod_smoke_test.py
+!/scripts/build_cache_172.py
+!/scripts/run_v52_cached_runpod.py
 /tmp_remote_collector/
 /remote_runs/
 /catboost_info/
