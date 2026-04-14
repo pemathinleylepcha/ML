@@ -14,6 +14,8 @@ __pycache__/
 !src/staged_v5/data/**
 !src/staged_v4/models/
 !src/staged_v4/models/**
+!src/staged_v5/models/
+!src/staged_v5/models/**
 DOC/*.md
 DOC/**/*.md
 DOC/IDEA-GRPO/
