@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 from pathlib import Path
+import threading
 import time
 
 import numpy as np
@@ -19,6 +20,9 @@ from staged_v5.utils.runtime_logging import log_progress, write_status
 _MAX_TPO_BARS = 500_000
 _DEFAULT_SYMBOL_TIMEOUT_SEC = 300.0
 _DEFAULT_BATCH_DEADLINE_SEC = 3600.0
+# Lock to serialize compute_tpo_memory_state C extension calls —
+# the extension is not thread-safe under concurrent access.
+_TPO_LOCK = threading.Lock()
 
 
 def _lagged_logret_matrix(close: np.ndarray, lag: int) -> np.ndarray:
@@ -136,11 +140,13 @@ def _build_symbol_aux_features(
             source_high = tpo_source_frame["h"].fillna(0.0).to_numpy(dtype=np.float32)
             source_low = tpo_source_frame["l"].fillna(0.0).to_numpy(dtype=np.float32)
             source_close = tpo_source_frame["c"].fillna(0.0).to_numpy(dtype=np.float32)
-            source_tpo, source_vol = compute_tpo_feature_panel(source_high, source_low, source_close)
+            with _TPO_LOCK:
+                source_tpo, source_vol = compute_tpo_feature_panel(source_high, source_low, source_close)
             node_tpo = source_tpo[tpo_lookup]
             node_vol = source_vol[tpo_lookup]
         elif valid_rows <= _MAX_TPO_BARS and len(close_col) <= _MAX_TPO_BARS:
-            node_tpo, node_vol = compute_tpo_feature_panel(high_col, low_col, close_col)
+            with _TPO_LOCK:
+                node_tpo, node_vol = compute_tpo_feature_panel(high_col, low_col, close_col)
         else:
             tpo_skipped_large = True
         tpo_duration = time.perf_counter() - tpo_started
