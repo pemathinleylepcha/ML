@@ -386,10 +386,15 @@ def _presweep_tpo(
 
         # Run TPO sequentially — compute_tpo_memory_state C extension is not
         # thread-safe; concurrent ThreadPoolExecutor calls cause segfaults.
-        for symbol in symbols:
+        for sym_idx, symbol in enumerate(symbols, 1):
             sym, result = _one(symbol)
             if result is not None:
                 tpo_panels[source_timeframe][sym] = result
+            if logger is not None and (sym_idx % 5 == 0 or sym_idx == len(symbols)):
+                logger.info(
+                    "state=tpo_presweep_progress source_tf=%s symbol=%s %d/%d",
+                    source_timeframe, sym, sym_idx, len(symbols),
+                )
         if logger is not None:
             logger.info(
                 "state=tpo_presweep source_tf=%s symbols=%d workers=%d",
